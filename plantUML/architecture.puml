@@ -1,0 +1,141 @@
+@startuml architecture_rdbms
+!theme plain
+
+title Relational Database Management System (RDBMS) Architecture
+
+skinparam componentStyle rectangle
+skinparam rectangle {
+  FontColor #333333
+  BorderColor #999999
+  BackgroundColor #FAFAFA
+  RoundCorner 10
+}
+skinparam noteBackgroundColor #FFFDE7
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+
+'──────────────────────────────
+' CONNECTORS
+'──────────────────────────────
+rectangle "Connectors" as connectors {
+  component "Native SQL CLI" as cli
+  component "ODBC / JDBC Drivers" as jdbc
+  component "REST / gRPC APIs" as grpc
+  component "Language Bindings\n(C, Java, Golang, etc.)" as bindings
+}
+
+'──────────────────────────────
+' MAIN SERVER
+'──────────────────────────────
+rectangle "Database Server Core" as server {
+
+  rectangle "Connection & Session Management" as conn {
+    component "Authentication" as auth
+    component "Thread / Session Pool" as pool
+    component "Connection Limits & Caches" as sess
+  }
+
+  rectangle "SQL Processor" as sqlproc {
+    component "SQL Interface\n(DML, DDL, Views, Triggers, Procedures)" as sqliface
+    component "Parser & Analyzer\n(Syntax, Privilege, Query Rewrite)" as parser
+    component "Query Optimizer\n(Cost-based, Heuristics, Access Paths)" as optimizer
+    component "Executor Engine\n(Iterators, Joins, Expressions)" as executor
+  }
+
+  rectangle "Transaction & Concurrency Control" as txn {
+    component "Transaction Manager\n(Begin, Commit, Rollback)" as txnmgr
+    component "Lock / MVCC Manager" as lockmgr
+    component "Recovery & Logging\n(WAL, Checkpoints, Undo/Redo)" as recovery
+  }
+
+  rectangle "Caches & Buffers" as cache {
+    component "Buffer Pool\n(Page Cache, LRU)" as buffer
+    component "Query Cache" as qcache
+  }
+
+  rectangle "Management & Utilities" as mgmt {
+    component "Backup / Restore" as backup
+    component "Replication / Cluster" as repl
+    component "Configuration & Admin" as admin
+    component "Monitoring & Metrics" as monitor
+  }
+}
+
+'──────────────────────────────
+' STORAGE ENGINES
+'──────────────────────────────
+rectangle "Pluggable Storage Engines" as engines {
+  component "B+Tree Engine" as btree
+  component "LSM Engine" as lsm
+  component "Memory Engine" as mem
+  component "Columnar Engine" as col
+  component "Custom Engine Plugin" as custom
+}
+
+'──────────────────────────────
+' FILE SYSTEM
+'──────────────────────────────
+rectangle "File System Layer" as fs {
+  component "Data & Index Files" as datafile
+  component "Redo / Undo Logs" as redolog
+  component "System Catalog & Metadata" as meta
+}
+
+'──────────────────────────────
+' RELATION FLOW
+'──────────────────────────────
+cli --> auth
+grpc --> auth
+jdbc --> auth
+bindings --> auth
+
+auth --> sqliface
+sqliface --> parser
+parser --> optimizer
+optimizer --> executor
+executor --> txnmgr
+executor --> buffer
+executor --> qcache
+txnmgr --> recovery
+
+executor --> btree
+executor --> lsm
+executor --> mem
+executor --> col
+executor --> custom
+
+btree --> datafile
+lsm --> datafile
+mem --> datafile
+col --> datafile
+custom --> datafile
+
+recovery --> redolog
+txnmgr --> redolog
+meta --> datafile
+
+monitor --> txnmgr
+admin --> auth
+backup --> datafile
+repl --> txnmgr
+
+'──────────────────────────────
+' NOTES
+'──────────────────────────────
+note top of server
+This layer represents the main logic of an RDBMS:
+connection handling, SQL parsing, optimization,
+execution, transaction control, caching, and system management.
+end note
+
+note bottom of engines
+Each storage engine implements a unified interface:
+record management, index access, and transaction hooks.
+end note
+
+note bottom of fs
+File system handles persistence and durability:
+data files, logs, and metadata catalogs.
+end note
+
+@enduml
