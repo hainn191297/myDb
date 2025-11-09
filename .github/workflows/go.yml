@@ -1,0 +1,52 @@
+# ===========================================================
+# GitHub Actions Workflow: Build & Test Go Project (myDb)
+# ===========================================================
+
+name: Go CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Checkout source
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Set up Go environment
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version-file: 'go.mod'   # lấy version trực tiếp từ go.mod
+          cache: true                 # cache module để build nhanh hơn
+
+      # Verify dependencies
+      - name: Download dependencies
+        run: go mod download
+
+      # Lint (optional nhưng nên có)
+      - name: Vet and format check
+        run: |
+          go vet ./...
+          test -z "$(gofmt -l .)" || (echo "Please format Go files:"; gofmt -l .; exit 1)
+
+      # Build main daemon
+      - name: Build mydbd
+        run: go build -v ./cmd/mydbd
+
+      # Run unit tests
+      - name: Test
+        run: go test -v ./...
+
+      # (Optional) Save binary as artifact
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mydbd-binary
+          path: cmd/mydbd/mydbd
