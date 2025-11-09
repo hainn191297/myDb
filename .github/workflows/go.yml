@@ -19,34 +19,46 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Set up Go environment
+      # Set up Go (lấy version từ go.mod)
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
-          go-version-file: 'go.mod'   # lấy version trực tiếp từ go.mod
-          cache: true                 # cache module để build nhanh hơn
+          go-version-file: 'go.mod'
+          cache: true
 
-      # Verify dependencies
+      # Download dependencies
       - name: Download dependencies
         run: go mod download
 
-      # Lint (optional nhưng nên có)
-      - name: Vet and format check
+      # Auto format (prevent CI fail)
+      - name: Auto format Go code
+        run: gofmt -w .
+
+      # Check formatting (ensure no missing fmt)
+      - name: Format check
         run: |
-          go vet ./...
-          test -z "$(gofmt -l .)" || (echo "Please format Go files:"; gofmt -l .; exit 1)
+          UNFORMATTED=$(gofmt -l .)
+          if [ -n "$UNFORMATTED" ]; then
+            echo "These files are not formatted:"
+            echo "$UNFORMATTED"
+            exit 1
+          fi
+
+      # Lint
+      - name: Vet
+        run: go vet ./...
 
       # Build main daemon
       - name: Build mydbd
-        run: go build -v ./cmd/mydbd
+        run: go build -o mydbd ./cmd/mydbd
 
       # Run unit tests
       - name: Test
         run: go test -v ./...
 
-      # (Optional) Save binary as artifact
+      # Upload binary artifact
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
           name: mydbd-binary
-          path: cmd/mydbd/mydbd
+          path: mydbd
