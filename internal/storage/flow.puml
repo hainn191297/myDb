@@ -1,0 +1,96 @@
+@startuml
+title Buffer Pool Lifecycle (Detailed)
+
+skinparam {
+    shadowing false
+    ArrowColor #444444
+    ParticipantFontSize 12
+    ActorFontSize 12
+}
+
+actor "Client Query" as Client
+participant "Buffer Pool" as BP
+participant "Page Table" as PT
+participant "Frame / Slot" as Frame
+participant "Free List" as FreeList
+participant "LRU List" as LRU
+participant "Page Manager" as PM
+database "Disk (Data Files)" as Disk
+
+== Request Page ==
+
+Client -> BP: GetPage(PageID)
+BP -> PT: Lookup PageID
+alt Cache Hit
+    PT --> BP: frameID
+    BP -> Frame: pinCnt++
+    Frame --> BP: return page
+    BP --> Client: Page (HIT)
+else Cache Miss
+    PT --> BP: not found
+
+    alt Free frame available
+        BP -> FreeList: Pop frame
+    else Buffer Full
+        BP -> LRU: Select victim
+        loop Until unpinned
+            alt Victim pinned
+                LRU --> BP: pinCnt > 0
+                BP -> LRU: Next candidate
+            else Victim unpinned
+                alt Dirty page
+                    BP -> Frame: Dirty?
+                    Frame --> BP: true
+                    BP -> PM: Flush Page
+                    PM -> Disk: Write 4KB block
+                    Disk --> PM: ok
+                    PM --> BP: ok
+                else Clean page
+                    Frame --> BP: false
+                    BP -> BP: Skip flush
+                end
+                BP -> PT: Remove victim mapping
+                break
+            end
+        end
+    end
+
+    BP -> PM: ReadPage(PageID)
+    PM -> Disk: read block @ offset
+    Disk --> PM: Page bytes
+    PM --> BP: Page
+
+    BP -> Frame: Load data\npinCnt = 1\nDirty = false
+    BP -> LRU: Insert to front
+    BP -> PT: Insert PageID -> frame
+    BP --> Client: Page (MISS)
+end
+
+== Update ==
+
+Client -> BP: MarkDirty(PageID)
+BP -> Frame: Dirty = true
+
+== Release ==
+
+Client -> BP: Unpin(PageID)
+BP -> Frame: pinCnt--
+alt pinCnt == 0
+    BP -> LRU: Move toward tail
+else Still pinned
+    BP -> BP: Keep at head
+end
+
+== Background Flush ==
+
+BP -> LRU: Pick cold dirty page
+LRU --> BP: candidate
+alt Dirty and unpinned
+    BP -> PM: WritePage(Page)
+    PM -> Disk: write 4KB block
+    Disk --> PM: ok
+    PM --> BP: ok
+else No flush needed
+end
+
+@enduml
