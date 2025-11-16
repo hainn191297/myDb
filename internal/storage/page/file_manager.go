@@ -27,10 +27,10 @@ IMPORTANT:
   - Page layout, free list, B+Tree, etc. are in higher layers.
 */
 type FileManager struct {
-	filePath string   // full path of this table file, e.g. "data/product.db"
-	file     *os.File // opened file descriptor
-	mu       sync.Mutex
-	nextPage PageID // ID to assign for the next allocated page
+	filePath string       // full path of this table file, e.g. "data/product.db"
+	file     *os.File     // opened file descriptor
+	mu       sync.RWMutex // change to RWMutex to allow concurrent reads
+	nextPage PageID       // ID to assign for the next allocated page
 }
 
 /*
@@ -67,7 +67,7 @@ func NewFileManager(filePath string) (*FileManager, error) {
 	}
 
 	// compute how many pages already exist
-	numPages := stat.Size() / PageSize
+	numPages := stat.Size() / int64(PageSize) // change to int64
 	next := PageID(numPages + 1)
 
 	return &FileManager{
@@ -114,8 +114,9 @@ ReadAt returns an error.
 This matches the behavior of real DBMS engines.
 */
 func (fm *FileManager) ReadPage(id PageID) (*Page, error) {
-	fm.mu.Lock()
-	defer fm.mu.Unlock()
+	fm.mu.RLock()
+	defer fm.mu.RUnlock()
+
 	offset := int64(id-1) * PageSize
 	data := make([]byte, PageSize)
 
@@ -141,10 +142,17 @@ WriteAt will automatically extend the file.
 This is how most DBMS implement append-only page allocation.
 */
 func (fm *FileManager) WritePage(p *Page) error {
+	if len(p.Data) != PageSize {
+		return fmt.Errorf(
+			"fm: invalid page size %d for page %d (expected %d)",
+			len(p.Data), p.ID, PageSize,
+		)
+	}
+
 	fm.mu.Lock()
 	defer fm.mu.Unlock()
 
-	offset := int64(p.ID-1) * PageSize
+	offset := (int64(p.ID) - 1) * int64(PageSize)
 
 	_, err := fm.file.WriteAt(p.Data, offset)
 	if err != nil {
@@ -180,13 +188,13 @@ NumPages
 	Useful for validation, debugging, or storage engine metadata.
 */
 func (fm *FileManager) NumPages() (int64, error) {
-	fm.mu.Lock()
-	defer fm.mu.Unlock()
+	fm.mu.RLock()
+	defer fm.mu.RUnlock()
 	stat, err := fm.file.Stat()
 	if err != nil {
 		return 0, fmt.Errorf("fm: stat failed: %w", err)
 	}
-	return stat.Size() / PageSize, nil
+	return stat.Size() / int64(PageSize), nil
 }
 
 /*
