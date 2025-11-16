@@ -6,58 +6,63 @@ import (
 	"sync"
 
 	"github.com/hainn191297/myDb/internal/storage/page"
+	"github.com/hainn191297/myDb/internal/storage/wal"
 )
 
 /*
-BufferPool is the in-memory cache that holds a subset of disk pages
-to reduce expensive disk I/O. It is one of the most important components
-in a DBMS (similar to PostgreSQL, MySQL, SQLite).
+BufferPool manages a fixed-size in-memory cache of pages.
+Each Pool operates on the FileManager supplied at construction time
+(TableManager typically hands out one FileManager per table file).
 
-Every entry in the buffer pool is a "frame". Each frame contains a Page
-and metadata such as:
-
-  - dirty bit:   whether the page was modified
-  - pin count:   prevents eviction while in use
-  - LRU position
-
-When the buffer pool is full, the replacement strategy (LRU here)
-selects a victim page to evict.
+Main components:
+- frames:   map[PageID]*list.Element     → active frames
+- lru:      doubly-linked list of *Frame  → eviction order
+- freeList: pool of empty frames
+- fm:       FileManager → performs disk I/O for that table file
 */
 type Pool struct {
 	mu       sync.Mutex
-	capacity int                           // max number of pages allowed in RAM
-	frames   map[page.PageID]*list.Element // maps pageID to *list.Element
-	lru      *list.List                    // LRU list of *Frame
-	fm       *page.FileManager             // disk I/O manager
-	freeList []*Frame                      // list of free frames
+	capacity int
+
+	frames map[page.PageID]*list.Element
+	lru    *list.List // front = most recently used, back = LRU
+
+	freeList []*Frame // preallocated empty frames
+	fm       *page.FileManager
+
+	table string
+	wal   wal.Logger
 }
 
 /*
-Frame represents one slot in the buffer pool. It contains:
+Frame = one buffer pool slot.
 
-  - Page   → pointer to actual 4KB page
-  - Dirty  → true if page was modified (must flush before eviction)
-  - pinCnt → number of clients holding this page; cannot evict if > 0
+Reset rules:
+- When evicted, frame goes back to freeList.
+- LRU only contains frames that are actively mapped to a page.
 */
 type Frame struct {
 	Page   *page.Page
 	Dirty  bool
-	pinCnt int // number of clients using page, cannot evict if > 0
+	pinCnt int
 }
 
 /*
-NewPool creates a new BufferPool with the given capacity and FileManager.
+NewPool preallocates all frame slots and stores them inside freeList.
+This avoids GC overhead and mimics InnoDB/Postgres architecture.
 */
-func NewPool(capacity int, fm *page.FileManager) *Pool {
+func NewPool(capacity int, fm *page.FileManager, table string, logger wal.Logger) *Pool {
 	p := &Pool{
 		capacity: capacity,
 		frames:   make(map[page.PageID]*list.Element),
 		lru:      list.New(),
-		fm:       fm,
 		freeList: make([]*Frame, 0, capacity),
+		fm:       fm,
+		table:    table,
+		wal:      logger,
 	}
 
-	// Pre-allocate empty frames (capacity number)
+	// Preallocate frames as empty slots
 	for i := 0; i < capacity; i++ {
 		p.freeList = append(p.freeList, &Frame{})
 	}
@@ -66,100 +71,91 @@ func NewPool(capacity int, fm *page.FileManager) *Pool {
 }
 
 /*
-GetPage:
-  - If page is cached → HIT → move to front → pin++
-  - If page is not cached → MISS → read from disk → evict if needed → create frame
+Get(id) loads a page into buffer pool:
+
+1. Cache hit  → return frame, pin++, move to LRU front
+2. Cache miss → load from disk, use free frame OR evict, insert to LRU front
 */
-func (p *Pool) Get(pageID page.PageID) (*page.Page, error) {
+func (p *Pool) Get(pid page.PageID) (*page.Page, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// cache hit
-	if elem, ok := p.frames[pageID]; ok {
-
-		frame := elem.Value.(*Frame)
-		frame.pinCnt++ // same like cnt in shared pointer LOL; used to prevent eviction
-
-		// move to front of LRU list
+	// HIT
+	if elem, ok := p.frames[pid]; ok {
+		f := elem.Value.(*Frame)
+		f.pinCnt++
 		p.lru.MoveToFront(elem)
-		return frame.Page, nil
+		return f.Page, nil
 	}
 
-	// cache miss: read page from disk
-	page, err := p.fm.ReadPage(page.PageID(pageID))
+	// MISS → load from disk
+	pg, err := p.fm.ReadPage(pid)
 	if err != nil {
-		return nil, fmt.Errorf("buffer: read page %d: %w", pageID, err)
+		return nil, fmt.Errorf("buffer: read page %v: %w", pid, err)
 	}
+	pg.Table = p.table
 
-	// if buffer pool is full, evict a page
-	if p.lru.Len() >= p.capacity {
-		if err := p.evict(); err != nil {
+	// choose frame
+	var frame *Frame
+	if len(p.freeList) > 0 {
+		idx := len(p.freeList) - 1
+		frame = p.freeList[idx]
+		p.freeList = p.freeList[:idx]
+	} else {
+		frame, err = p.evict()
+		if err != nil {
 			return nil, err
 		}
 	}
 
-	// insert new frame into buffer pool
-	frame := &Frame{
-		Page:   page,
-		Dirty:  false,
-		pinCnt: 1, // pin count starts at 1
-	}
+	frame.Page = pg
+	frame.Dirty = false
+	frame.pinCnt = 1
+
 	elem := p.lru.PushFront(frame)
-	p.frames[pageID] = elem
+	p.frames[pid] = elem
 
-	return page, nil
+	return pg, nil
 }
 
-/*
-MarkDirty:
-
-	Marks a page as modified so that eviction or Shutdown
-	will flush the page back to disk.
-*/
-func (p *Pool) MarkDirty(pageID page.PageID) {
+func (p *Pool) MarkDirty(pid page.PageID) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if elem, ok := p.frames[pageID]; ok {
-		frame := elem.Value.(*Frame)
-		frame.Dirty = true
+	if elem, ok := p.frames[pid]; ok {
+		elem.Value.(*Frame).Dirty = true
 	}
 }
 
-/*
-Unpin:
-
-	Decrements the pin count of a page, allowing it to be evicted
-	if no clients are using it.
-*/
-func (p *Pool) Unpin(pageID page.PageID) {
+func (p *Pool) Unpin(pid page.PageID) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if elem, ok := p.frames[pageID]; ok {
-		frame := elem.Value.(*Frame)
-		if frame.pinCnt > 0 {
-			frame.pinCnt--
+	if elem, ok := p.frames[pid]; ok {
+		f := elem.Value.(*Frame)
+		if f.pinCnt > 0 {
+			f.pinCnt--
 		}
 	}
 }
 
-/*
-FlushAll:
-
-	Writes all dirty pages back to disk.
-*/
 func (p *Pool) FlushAll() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	for id, elem := range p.frames {
-		frame := elem.Value.(*Frame)
-		if frame.Dirty {
-			if err := p.fm.WritePage(frame.Page); err != nil {
-				return fmt.Errorf("buffer: flush page %d: %w", id, err)
+	for pid, elem := range p.frames {
+		f := elem.Value.(*Frame)
+		if f.Dirty {
+			if err := p.writePage(f.Page); err != nil {
+				return fmt.Errorf("flush page %v: %w", pid, err)
 			}
-			frame.Dirty = false
+			f.Dirty = false
+		}
+	}
+
+	if p.wal != nil {
+		if err := p.wal.Sync(); err != nil {
+			return err
 		}
 	}
 
@@ -167,34 +163,50 @@ func (p *Pool) FlushAll() error {
 }
 
 /*
-evict:
+evict() selects the least-recently-used *unpinned* frame,
+flushes if dirty, removes it from structures, resets it,
+and then returns it so Get() can reassign it.
 
-	Selects a victim page using LRU and evicts it from the buffer pool.
-	If the page is dirty, it is flushed to disk before eviction.
-	Skips pages that are currently pinned (in use).
+Flow:
+  - iterate from LRU tail
+  - skip pinned frames
+  - flush dirty pages
+  - remove map + LRU
+  - reset frame, push to freeList
 */
-func (p *Pool) evict() error {
+func (p *Pool) evict() (*Frame, error) {
 	for e := p.lru.Back(); e != nil; e = e.Prev() {
-		frame := e.Value.(*Frame)
-		pageID := uint32(frame.Page.ID)
+		f := e.Value.(*Frame)
 
-		// skip pinned pages
-		if frame.pinCnt > 0 {
+		if f.pinCnt > 0 {
 			continue
 		}
 
-		// flush if dirty
-		if frame.Dirty {
-			if err := p.fm.WritePage(frame.Page); err != nil {
-				return fmt.Errorf("buffer: evict page %d: %w", pageID, err)
+		if f.Dirty {
+			if err := p.writePage(f.Page); err != nil {
+				return nil, fmt.Errorf("evict flush page %v: %w", f.Page.ID, err)
 			}
 		}
 
-		// remove from buffer pool
-		delete(p.frames, frame.Page.ID)
+		delete(p.frames, f.Page.ID)
 		p.lru.Remove(e)
-		return nil
+
+		// reset frame
+		f.Page = nil
+		f.Dirty = false
+		f.pinCnt = 0
+
+		return f, nil
 	}
 
-	return fmt.Errorf("buffer: no unpinned pages to evict")
+	return nil, fmt.Errorf("buffer: no unpinned pages to evict")
+}
+
+func (p *Pool) writePage(pg *page.Page) error {
+	if p.wal != nil {
+		if err := p.wal.Append(p.table, pg.ID, pg.Data); err != nil {
+			return err
+		}
+	}
+	return p.fm.WritePage(pg)
 }

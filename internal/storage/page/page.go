@@ -5,16 +5,18 @@ const PageSize = 4096
 
 type PageID int64
 
-// Page represents a fixed-size block of data.
+// Page represents a fixed-size 4KB block belonging to a given table file.
 type Page struct {
-	ID   PageID
-	Data []byte
+	Table string // e.g. "product.ibd"
+	ID    PageID
+	Data  []byte
 }
 
-// NewPage creates a new page with the given ID.
-func NewPage(id PageID) *Page {
+// NewPage creates an empty page buffer for the given table and ID.
+func NewPage(table string, id PageID) *Page {
 	return &Page{
-		ID:   id,
-		Data: make([]byte, PageSize),
+		Table: table,
+		ID:    id,
+		Data:  make([]byte, PageSize),
 	}
 }

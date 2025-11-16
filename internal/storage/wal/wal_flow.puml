@@ -1,0 +1,31 @@
+@startuml
+title WAL Append Sequence
+
+skinparam {
+    shadowing false
+    ArrowColor #444
+    ParticipantFontSize 12
+}
+
+participant "Buffer Pool" as BP
+participant "WAL Logger" as WAL
+database "WAL File" as Log
+participant "FileManager" as FM
+database "Data File" as Disk
+
+== Dirty Page Flush ==
+
+BP -> WAL: Append(table, PageID, bytes)
+WAL -> Log: write record (tableLen, table, pageID, dataLen, data)
+WAL --> BP: ok
+BP -> FM: WritePage(Page)
+FM -> Disk: write block
+
+== Explicit Flush ==
+
+BP -> WAL: Sync()
+WAL --> BP: log durable
+BP -> FM: Sync()
+FM --> BP: data durable
+
+@enduml

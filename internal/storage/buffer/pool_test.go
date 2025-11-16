@@ -1,14 +1,19 @@
 package buffer
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/hainn191297/myDb/internal/storage/page"
+	"github.com/hainn191297/myDb/internal/storage/wal"
 )
 
 func newFM(t *testing.T) *page.FileManager {
+	t.Helper()
 	dir := t.TempDir()
-	fm, err := page.NewFileManager(dir)
+	file := filepath.Join(dir, "table.db")
+	fm, err := page.NewFileManager(file)
 	if err != nil {
 		t.Fatalf("cannot create file manager: %v", err)
 	}
@@ -17,16 +22,15 @@ func newFM(t *testing.T) *page.FileManager {
 
 func TestCacheMissLoadsFromDisk(t *testing.T) {
 	fm := newFM(t)
-	pool := NewPool(2, fm)
+	pool := NewPool(2, fm, "table.db", nil)
 
 	id, _ := fm.AllocatePage()
 
-	// Write something to page on disk
-	pg := page.NewPage(id)
+	pg := page.NewPage("table.db", id)
 	copy(pg.Data, []byte("hello"))
-	_ = fm.WritePage(pg)
+	fm.WritePage(pg)
 
-	// GetPage → MISS → load from disk
+	// MISS → load from disk
 	got, err := pool.Get(id)
 	if err != nil {
 		t.Fatalf("GetPage error: %v", err)
@@ -39,22 +43,22 @@ func TestCacheMissLoadsFromDisk(t *testing.T) {
 
 func TestCacheHitDoesNotReadFromDiskAgain(t *testing.T) {
 	fm := newFM(t)
-	pool := NewPool(2, fm)
+	pool := NewPool(2, fm, "table.db", nil)
 
 	id, _ := fm.AllocatePage()
 
-	pg := page.NewPage(id)
+	pg := page.NewPage("table.db", id)
 	copy(pg.Data, []byte("data1"))
 	fm.WritePage(pg)
 
-	// First read: MISS
+	// First read: load into RAM
 	_, _ = pool.Get(id)
 
-	// Modify file on disk (simulate stale disk)
+	// Modify disk to simulate stale disk content
 	copy(pg.Data, []byte("xxxx"))
 	fm.WritePage(pg)
 
-	// Second read should be HIT (no disk read)
+	// Second read MUST be HIT → must still get "data1"
 	got, err := pool.Get(id)
 	if err != nil {
 		t.Fatalf("GetPage error: %v", err)
@@ -67,98 +71,150 @@ func TestCacheHitDoesNotReadFromDiskAgain(t *testing.T) {
 
 func TestEvictionOccursWhenPoolFull(t *testing.T) {
 	fm := newFM(t)
-	pool := NewPool(1, fm) // capacity = 1
+
+	// capacity=1 but freeList also has 1 preallocated frame
+	pool := NewPool(1, fm, "table.db", nil)
+
 	id1, _ := fm.AllocatePage()
 	id2, _ := fm.AllocatePage()
 
-	fm.WritePage(page.NewPage(id1))
-	fm.WritePage(page.NewPage(id2))
+	fm.WritePage(page.NewPage("table.db", id1))
+	fm.WritePage(page.NewPage("table.db", id2))
 
-	// Load page 1
+	// Load page1 → occupy a frame
 	_, _ = pool.Get(id1)
 
-	// Load page 2 → evict page 1
-	_, _ = pool.Get(id2)
+	// Now freeList is empty, next load MUST evict
+	pool.Unpin(id1) // allow eviction
 
-	// page 1 should not be cached anymore
-	if _, ok := pool.Get(id1); ok == nil {
-		// second GetPage should re-load from disk (cache miss), not hit
+	_, err := pool.Get(id2)
+	if err != nil {
+		t.Fatalf("unexpected eviction error: %v", err)
+	}
+
+	// page1 should have been removed from frames map
+	if _, ok := pool.frames[id1]; ok {
+		t.Fatalf("page1 should have been evicted from buffer")
+	}
+
+	// Unpin page2 so pool can reuse the slot
+	pool.Unpin(id2)
+
+	// Reload page1 to ensure miss path still works
+	if _, err := pool.Get(id1); err != nil {
+		t.Fatalf("expected to reload evicted page: %v", err)
 	}
 }
 
 func TestDirtyPageFlushOnEvict(t *testing.T) {
 	fm := newFM(t)
-	pool := NewPool(1, fm)
+	pool := NewPool(1, fm, "table.db", nil)
 
 	id1, _ := fm.AllocatePage()
 	id2, _ := fm.AllocatePage()
 
-	pg1 := page.NewPage(id1)
+	pg1 := page.NewPage("table.db", id1)
 	copy(pg1.Data, []byte("dirty!"))
 	fm.WritePage(pg1)
 
 	// Load page 1
 	p1, _ := pool.Get(id1)
 
-	// Modify in buffer, not disk
+	// Modify in RAM only
 	copy(p1.Data, []byte("memory"))
 	pool.MarkDirty(id1)
 
-	// unpin page 1 to allow eviction → pinCnt = 0 → evicted to flush
+	// allow eviction
 	pool.Unpin(id1)
 
-	// Load page 2 → force eviction of page1
-	fm.WritePage(page.NewPage(id2))
-
+	// Load page 2 → evict page1
+	fm.WritePage(page.NewPage("table.db", id2))
 	_, _ = pool.Get(id2)
-	// Read page1 from disk → must equal "memory"
+
+	// Must have flushed "memory"
 	diskPg, _ := fm.ReadPage(id1)
 	if string(diskPg.Data[:6]) != "memory" {
-		t.Fatalf("dirty page not flushed before evict, disk has: %q", diskPg.Data[:6])
+		t.Fatalf("dirty page not flushed, disk has: %q", diskPg.Data[:6])
 	}
 }
 
 func TestPinnedPageCannotBeEvicted(t *testing.T) {
 	fm := newFM(t)
-	pool := NewPool(1, fm)
+
+	// capacity=1 → freeList has 1 frame only
+	pool := NewPool(1, fm, "table.db", nil)
 
 	id1, _ := fm.AllocatePage()
 	id2, _ := fm.AllocatePage()
 
-	fm.WritePage(page.NewPage(id1))
-	fm.WritePage(page.NewPage(id2))
+	fm.WritePage(page.NewPage("table.db", id1))
+	fm.WritePage(page.NewPage("table.db", id2))
 
-	// Load page 1 + pin it
-	_, _ = pool.Get(id1) // pinCnt = 1
-	// Try to load page 2 → eviction should fail
+	// Load page1 (pinCnt=1)
+	_, _ = pool.Get(id1)
+
+	// freeList empty now; next Get MUST try eviction
 	_, err := pool.Get(id2)
+
 	if err == nil {
-		t.Fatalf("expected eviction to fail when pinned pages exist")
+		t.Fatalf("expected eviction to fail when pinned frames exist")
 	}
 }
 
 func TestFlushAllWritesDirtyPages(t *testing.T) {
 	fm := newFM(t)
-	pool := NewPool(2, fm)
+	pool := NewPool(2, fm, "table.db", nil)
 
 	id, _ := fm.AllocatePage()
-	fm.WritePage(page.NewPage(id))
+	fm.WritePage(page.NewPage("table.db", id))
 
-	// Load page into buffer
+	// Load
 	p, _ := pool.Get(id)
 
-	// Modify page in RAM only
+	// Modify RAM only
 	copy(p.Data, []byte("changes"))
 	pool.MarkDirty(id)
 
-	// Flush all
+	// Flush all dirty pages
 	if err := pool.FlushAll(); err != nil {
 		t.Fatalf("FlushAll error: %v", err)
 	}
 
-	// Check disk
 	onDisk, _ := fm.ReadPage(id)
 	if string(onDisk.Data[:7]) != "changes" {
 		t.Fatalf("FlushAll did not write dirty page to disk")
+	}
+}
+
+func TestFlushAllAppendsToWAL(t *testing.T) {
+	fm := newFM(t)
+
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "table.wal")
+	logger, err := wal.OpenLogger(logPath)
+	if err != nil {
+		t.Fatalf("open wal: %v", err)
+	}
+	defer logger.Close()
+
+	pool := NewPool(1, fm, "public.table", logger)
+
+	id, _ := fm.AllocatePage()
+	fm.WritePage(page.NewPage("public.table", id))
+
+	p, _ := pool.Get(id)
+	copy(p.Data, []byte("abcd"))
+	pool.MarkDirty(id)
+
+	if err := pool.FlushAll(); err != nil {
+		t.Fatalf("FlushAll: %v", err)
+	}
+
+	info, err := os.Stat(logPath)
+	if err != nil {
+		t.Fatalf("stat wal: %v", err)
+	}
+	if info.Size() == 0 {
+		t.Fatalf("wal file should have records")
 	}
 }

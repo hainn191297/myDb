@@ -1,0 +1,60 @@
+@startuml
+
+title Heap Table Insert & Scan Flow
+
+skinparam {
+    shadowing false
+    ArrowColor #555
+    ParticipantFontSize 12
+}
+
+actor "Client" as Client
+participant "Heap Table" as Heap
+participant "Buffer Manager" as BM
+participant "Table Manager" as TM
+participant "WAL Manager" as WM
+participant "Buffer Pool" as BP
+participant "FileManager\n(table.db)" as FM
+database "Data File" as Disk
+database "WAL File" as WALFile
+
+== Insert ==
+
+Client -> Heap: Insert(tuple)
+Heap -> TM: OpenTable(schema, table)
+TM --> Heap: FileManager
+Heap -> FM: NumPages / Allocate if needed
+Heap -> BM: GetPage(schema, table, pid)
+BM -> BP: Get(PageID)
+BP --> BM: Page frame
+BM --> Heap: Page
+
+alt Page uninitialized
+    Heap -> BP: initPage + MarkDirty
+end
+
+alt Has free space
+    Heap -> BP: insertTuple\n(slot entry + payload)
+    BP -> WALFile: Append (via WAL logger)
+    BP -> Disk: WritePage (dirty)
+    Heap -> BM: Unpin + MarkDirty
+    Heap --> Client: RecordID
+else Page full
+    Heap -> BM: Unpin
+    Heap -> Heap: try next pid or allocate new page
+end
+
+== Scan ==
+
+Client -> Heap: Scan(callback)
+loop For each page
+    Heap -> BM: GetPage(pid)
+    BM -> BP: Get(PageID)
+    BP --> BM: Page
+    BM --> Heap: Page
+    Heap -> Heap: iterateSlots\nemit tuples to callback
+    Heap -> BM: Unpin(pid)
+end
+Heap --> Client: Done
+
+@enduml
