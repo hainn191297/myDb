@@ -20,6 +20,7 @@ type Manager struct {
 	paths map[string]string
 }
 
+// TODO: Create WAL recovery with UNDO/REDO file later.
 func NewManager(basePath string) *Manager {
 	return &Manager{
 		basePath: basePath,

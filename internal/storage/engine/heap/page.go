@@ -2,136 +2,218 @@ package heap
 
 import (
 	"encoding/binary"
-	"errors"
+	"fmt"
 
 	"github.com/hainn191297/myDb/internal/storage/page"
 )
 
+/*
+Heap page layout (slotted page):
+
+  [0:2]  slotCount   (uint16)  → number of directory slots
+  [2:4]  freeStart   (uint16)  → offset where free space currently begins
+  [4:freeStart)      tuple data region (grows upward)
+  [freeStart:freeEnd) free space
+  [freeEnd:PageSize) slot directory (grows downward from the end)
+
+Slot directory entry i (0-based):
+
+  offset := PageSize - 2*(i+1)
+  value  := uint16 tupleOffset OR 0xFFFF if slot is free
+
+NOTE:
+- We do NOT store tuple length here. Tuple encoding (len, columns, etc.)
+  thuộc về layer tuple.go – ở đây chỉ quản lý vị trí trong page.
+- Xoá slot chỉ đánh dấu slot offset = 0xFFFF; chưa compact free space.
+*/
+
 const (
-	headerSize   = 6 // slotCount(2) + slotDirEnd(2) + freeEnd(2)
-	slotEntryLen = 4 // offset(2) + length(2)
+	headerSize        = 4              // 2 bytes slotCount + 2 bytes freeStart
+	invalidSlotOffset = uint16(0xFFFF) // đánh dấu slot đã xoá / trống
 )
 
-type Slot struct {
-	Offset uint16
-	Length uint16
+// Page là wrapper cho *page.Page chứa layout heap ở trên.
+type Page struct {
+	raw *page.Page
 }
 
-func initPage(p *page.Page) {
-	writeHeader(p, 0, headerSize, page.PageSize)
+// WrapPage bọc một page vật lý thành heap.Page.
+func WrapPage(p *page.Page) *Page {
+	return &Page{raw: p}
 }
 
-func pageInitialized(p *page.Page) bool {
-	_, slotDirEnd, freeEnd := readHeader(p)
-	return slotDirEnd != 0 && freeEnd != 0
+// NewEmptyPage tạo một heap page mới với header khởi tạo.
+func NewEmptyPage(pid page.PageID) *Page {
+	p := page.NewPage(pid)
+	hp := &Page{raw: p}
+	hp.initHeader()
+	return hp
 }
 
-func readHeader(p *page.Page) (slots uint16, slotDirEnd uint16, freeEnd uint16) {
-	slots = binary.LittleEndian.Uint16(p.Data[0:2])
-	slotDirEnd = binary.LittleEndian.Uint16(p.Data[2:4])
-	freeEnd = binary.LittleEndian.Uint16(p.Data[4:6])
-	return
+// Raw trả về page vật lý bên dưới.
+func (hp *Page) Raw() *page.Page {
+	return hp.raw
 }
 
-func writeHeader(p *page.Page, slots, slotDirEnd, freeEnd uint16) {
-	binary.LittleEndian.PutUint16(p.Data[0:2], slots)
-	binary.LittleEndian.PutUint16(p.Data[2:4], slotDirEnd)
-	binary.LittleEndian.PutUint16(p.Data[4:6], freeEnd)
+// initHeader sets an empty header (no slots, freeStart after header).
+func (hp *Page) initHeader() {
+	data := hp.raw.Data
+	binary.LittleEndian.PutUint16(data[0:2], 0)                  // slotCount
+	binary.LittleEndian.PutUint16(data[2:4], uint16(headerSize)) // freeStart
 }
 
-func slotOffset(idx uint16) int {
-	return int(headerSize) + int(idx)*slotEntryLen
+// slotCount returns current number of slots (including free ones).
+func (hp *Page) slotCount() uint16 {
+	return binary.LittleEndian.Uint16(hp.raw.Data[0:2])
 }
 
-func getSlot(p *page.Page, index uint16) Slot {
-	offset := slotOffset(index)
-	return Slot{
-		Offset: binary.LittleEndian.Uint16(p.Data[offset : offset+2]),
-		Length: binary.LittleEndian.Uint16(p.Data[offset+2 : offset+4]),
+func (hp *Page) setSlotCount(n uint16) {
+	binary.LittleEndian.PutUint16(hp.raw.Data[0:2], n)
+}
+
+// freeStart is the offset where tuple data region ends / free space begins.
+func (hp *Page) freeStart() uint16 {
+	return binary.LittleEndian.Uint16(hp.raw.Data[2:4])
+}
+
+func (hp *Page) setFreeStart(off uint16) {
+	binary.LittleEndian.PutUint16(hp.raw.Data[2:4], off)
+}
+
+// freeEnd is where free space ends and slot directory begins.
+func (hp *Page) freeEnd() int {
+	return page.PageSize - int(hp.slotCount())*2
+}
+
+// FreeSpace returns size of contiguous free space.
+func (hp *Page) FreeSpace() int {
+	fs := int(hp.freeStart())
+	fe := hp.freeEnd()
+	if fe <= fs {
+		return 0
 	}
+	return fe - fs
 }
 
-func setSlot(p *page.Page, index uint16, s Slot) {
-	offset := slotOffset(index)
-	binary.LittleEndian.PutUint16(p.Data[offset:offset+2], s.Offset)
-	binary.LittleEndian.PutUint16(p.Data[offset+2:offset+4], s.Length)
+// NumSlots returns number of slots (including free ones).
+func (hp *Page) NumSlots() int {
+	return int(hp.slotCount())
 }
 
-func hasSpace(p *page.Page, payloadLen uint16) bool {
-	slots, slotDirEnd, freeEnd := readHeader(p)
-	if slotDirEnd == 0 && freeEnd == 0 {
-		return false
+// slotOffset returns tuple offset for slot i (or invalidSlotOffset).
+func (hp *Page) slotOffset(i int) uint16 {
+	if i < 0 || i >= int(hp.slotCount()) {
+		return invalidSlotOffset
 	}
-	if int(payloadLen) > page.PageSize {
-		return false
-	}
-
-	dataPos := int(freeEnd) - int(payloadLen)
-	if dataPos < 0 {
-		return false
-	}
-	_, hasFree := findFreeSlot(p, slots)
-	neededDir := int(slotDirEnd)
-	if !hasFree {
-		neededDir += slotEntryLen
-	}
-	return neededDir <= dataPos
+	data := hp.raw.Data
+	pos := page.PageSize - 2*(i+1)
+	return binary.LittleEndian.Uint16(data[pos : pos+2])
 }
 
-func insertTuple(p *page.Page, payload []byte) (uint16, error) {
-	payloadLen := uint16(len(payload))
-	if int(payloadLen) > page.PageSize-headerSize-slotEntryLen {
-		return 0, errTupleTooLarge
+func (hp *Page) setSlotOffset(i int, off uint16) {
+	if i < 0 || i >= int(hp.slotCount()) {
+		return
 	}
-
-	slots, slotDirEnd, freeEnd := readHeader(p)
-	freeSlot, hasFree := findFreeSlot(p, slots)
-	if !hasSpace(p, payloadLen) {
-		return 0, errNoSpace
-	}
-
-	writePos := freeEnd - payloadLen
-	copy(p.Data[writePos:writePos+payloadLen], payload)
-	var slotIdx uint16
-	if hasFree {
-		slotIdx = freeSlot
-	} else {
-		slotIdx = slots
-		slots++
-		slotDirEnd += slotEntryLen
-	}
-	setSlot(p, slotIdx, Slot{Offset: writePos, Length: payloadLen})
-	writeHeader(p, slots, slotDirEnd, writePos)
-	return slotIdx, nil
+	data := hp.raw.Data
+	pos := page.PageSize - 2*(i+1)
+	binary.LittleEndian.PutUint16(data[pos:pos+2], off)
 }
 
-func findFreeSlot(p *page.Page, slotCount uint16) (uint16, bool) {
-	for i := uint16(0); i < slotCount; i++ {
-		if getSlot(p, i).Length == 0 {
-			return i, true
-		}
+// IsSlotUsed reports whether slot i currently points to a tuple.
+func (hp *Page) IsSlotUsed(i int) bool {
+	return hp.slotOffset(i) != invalidSlotOffset
+}
+
+/*
+InsertTuple appends a new tuple into the free space and creates a new slot.
+
+RETURN:
+  - slot index (int) nếu thành công
+  - error nếu không đủ chỗ
+
+Ghi chú:
+- Chỉ check contiguous free space (không reclaim các lỗ do xoá).
+- tuple bytes đã được encode ở layer tuple.go.
+*/
+func (hp *Page) InsertTuple(tuple []byte) (int, error) {
+	need := len(tuple) + 2 // tuple data + 1 slot entry (2 bytes)
+	if need > hp.FreeSpace() {
+		return -1, fmt.Errorf("heap: not enough space for tuple (%d bytes free, need %d)", hp.FreeSpace(), need)
 	}
-	return 0, false
+
+	data := hp.raw.Data
+	slotCount := hp.slotCount()
+	freeStart := hp.freeStart()
+
+	// write tuple data at freeStart
+	copy(data[freeStart:int(freeStart)+len(tuple)], tuple)
+
+	// new slot index
+	newSlot := int(slotCount)
+	newSlotPos := page.PageSize - 2*(newSlot+1)
+	binary.LittleEndian.PutUint16(data[newSlotPos:newSlotPos+2], freeStart)
+
+	// update header
+	hp.setSlotCount(slotCount + 1)
+	hp.setFreeStart(freeStart + uint16(len(tuple)))
+
+	return newSlot, nil
 }
 
-func clearSlot(p *page.Page, slotIdx uint16) {
-	setSlot(p, slotIdx, Slot{Offset: 0, Length: 0})
+/*
+DeleteTuple marks slot i as free (invalidSlotOffset).
+Không compact heap ngay.
+*/
+func (hp *Page) DeleteTuple(slot int) error {
+	if slot < 0 || slot >= int(hp.slotCount()) {
+		return fmt.Errorf("heap: delete invalid slot %d", slot)
+	}
+	if !hp.IsSlotUsed(slot) {
+		return nil // already free
+	}
+	hp.setSlotOffset(slot, invalidSlotOffset)
+	return nil
 }
 
-func iterateSlots(p *page.Page, fn func(slotID int, data []byte) bool) {
-	slots, _, _ := readHeader(p)
-	for i := 0; i < int(slots); i++ {
-		slot := getSlot(p, uint16(i))
-		if slot.Length == 0 {
+/*
+GetTuple returns a slice view of the tuple bytes for slot i.
+
+IMPORTANT:
+  - Slice này trỏ trực tiếp vào page.Data (no copy).
+  - Tuple length phải do layer tuple.go giải mã (nếu có prefix length),
+    ở đây chỉ trả từ offset đến trước vùng freeStart / next tuple (không an toàn lắm).
+  - Hiện tại, ta chỉ support pattern: tuple encoder/decoder biết cách cắt.
+
+Để tránh đoán length ở đây, ta thường để tuple.go nhận (pageData, offset)
+và tự parse. Nên hàm này chỉ trả offset & raw tail.
+*/
+func (hp *Page) GetTupleRegion(slot int) (offset uint16, buf []byte, ok bool) {
+	if slot < 0 || slot >= int(hp.slotCount()) {
+		return 0, nil, false
+	}
+	off := hp.slotOffset(slot)
+	if off == invalidSlotOffset {
+		return 0, nil, false
+	}
+	data := hp.raw.Data
+	return off, data[off:hp.freeStart()], true
+}
+
+/*
+ForEach iterates over all USED slots and calls fn(slotIdx, offset).
+
+fn trả về false để dừng sớm.
+Layer khác (table/engine) sẽ dùng offset để giải mã tuple.
+*/
+func (hp *Page) ForEach(fn func(slot int, offset uint16) bool) {
+	n := int(hp.slotCount())
+	for i := 0; i < n; i++ {
+		off := hp.slotOffset(i)
+		if off == invalidSlotOffset {
 			continue
 		}
-		if !fn(i, p.Data[slot.Offset:slot.Offset+slot.Length]) {
+		if !fn(i, off) {
 			return
 		}
 	}
 }
-
-var (
-	errTupleTooLarge = errors.New("heap: tuple too large")
-	errNoSpace       = errors.New("heap: no free space on page")
-)

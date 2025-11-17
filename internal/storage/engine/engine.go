@@ -1,6 +1,9 @@
 package engine
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
 // Engine describes the pluggable storage interface.
 type Engine interface {
@@ -21,6 +24,9 @@ type Iterator interface {
 
 // ErrNotImplemented is returned by stub engines until functionality is filled in.
 var ErrNotImplemented = errPlaceholder("storage engine not implemented")
+
+// ErrKeyNotFound signals that the requested key does not exist.
+var ErrKeyNotFound = errors.New("storage engine: key not found")
 
 type errPlaceholder string
 

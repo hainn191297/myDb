@@ -15,6 +15,7 @@ func encodeTuple(key, value []byte) []byte {
 	return buf
 }
 
+// TODO: optimize allocations
 func decodeTuple(data []byte) ([]byte, []byte, error) {
 	if len(data) < 8 {
 		return nil, nil, fmt.Errorf("heap engine: corrupt tuple")

@@ -2,7 +2,6 @@ package engine
 
 import (
 	"fmt"
-	"sync"
 
 	"github.com/hainn191297/myDb/internal/storage/buffer"
 	"github.com/hainn191297/myDb/internal/storage/page"
@@ -10,107 +9,119 @@ import (
 )
 
 /*
-BufferManager coordinates TableManager + BufferPool.
-It lazily creates a buffer.Pool per (schema, table) combination so higher
-layers can fetch pages without opening FileManagers manually.
+BufferManager is the layer that:
+
+  - Resolves schema/table → FileID + FileManager (via TableManager)
+  - Loads pages via GlobalPool (which handles LRU + WAL)
+  - Exposes simple page-level API to storage engines (heap, btree)
+
+This makes the upper engines completely independent of I/O layout.
 */
 type BufferManager struct {
-	tableMgr *TableManager
-	walMgr   *wal.Manager
-	capacity int
-
-	mu    sync.Mutex
-	pools map[string]*buffer.Pool
+	tm   *TableManager
+	pool *buffer.GlobalPool
+	wal  wal.Logger
 }
 
-func NewBufferManager(tm *TableManager, walMgr *wal.Manager, capacity int) *BufferManager {
+func NewBufferManager(tm *TableManager, pool *buffer.GlobalPool, walLogger wal.Logger) *BufferManager {
 	return &BufferManager{
-		tableMgr: tm,
-		walMgr:   walMgr,
-		capacity: capacity,
-		pools:    make(map[string]*buffer.Pool),
+		tm:   tm,
+		pool: pool,
+		wal:  walLogger,
 	}
 }
 
-func (bm *BufferManager) poolKey(schema, table string) string {
-	return schema + "/" + table
-}
-
-// TableManager exposes the underlying table manager (needed for heap).
-func (bm *BufferManager) TableManager() *TableManager {
-	return bm.tableMgr
-}
-
 /*
-getPool returns (or constructs) the buffer pool for schema.table.
+GetPage returns (fileID, *Page):
+
+  - TableManager.OpenTable → (fid, fm)
+  - GlobalPool.GetPage(fid, pid, reader)
 */
-func (bm *BufferManager) getPool(schema, table string) (*buffer.Pool, error) {
-	key := bm.poolKey(schema, table)
+func (bm *BufferManager) GetPage(
+	schema, table string,
+	pid page.PageID,
+) (uint32, *page.Page, error) {
 
-	bm.mu.Lock()
-	defer bm.mu.Unlock()
-
-	if pool, ok := bm.pools[key]; ok {
-		return pool, nil
-	}
-
-	fm, err := bm.tableMgr.OpenTable(schema, table)
+	fid, fm, err := bm.tm.OpenTable(schema, table)
 	if err != nil {
-		return nil, fmt.Errorf("open table %s.%s: %w", schema, table, err)
+		return 0, nil, err
 	}
 
-	var logger wal.Logger
-	if bm.walMgr != nil {
-		logger, err = bm.walMgr.Open(schema, table)
-		if err != nil {
-			return nil, fmt.Errorf("open wal %s.%s: %w", schema, table, err)
-		}
+	reader := func(pid page.PageID) (*page.Page, error) {
+		return fm.ReadPage(pid)
 	}
 
-	pool := buffer.NewPool(bm.capacity, fm, bm.poolKey(schema, table), logger)
-	bm.pools[key] = pool
-	return pool, nil
-}
-
-func (bm *BufferManager) GetPage(schema, table string, pid page.PageID) (*page.Page, error) {
-	pool, err := bm.getPool(schema, table)
+	pg, err := bm.pool.GetPage(fid, pid, reader)
 	if err != nil {
-		return nil, err
+		return 0, nil, err
 	}
-	return pool.Get(pid)
+
+	return fid, pg, nil
 }
 
 /*
-MarkDirty flips the dirty flag for the given page inside its table pool.
+Unpin:
+
+  - dirty=false → unpin only
+  - dirty=true  → unpin + mark dirty
 */
-func (bm *BufferManager) MarkDirty(schema, table string, pid page.PageID) error {
-	pool, err := bm.getPool(schema, table)
-	if err != nil {
-		return err
-	}
-	pool.MarkDirty(pid)
-	return nil
+func (bm *BufferManager) Unpin(fid uint32, pid page.PageID, dirty bool) {
+	bm.pool.Unpin(fid, pid, dirty)
 }
 
 /*
-Unpin decrements the pin count so the page can become evictable.
+MarkDirty is a convenience helper.
+(NOTE: MarkDirty does NOT unpin!)
 */
-func (bm *BufferManager) Unpin(schema, table string, pid page.PageID) error {
-	pool, err := bm.getPool(schema, table)
-	if err != nil {
-		return err
-	}
-	pool.Unpin(pid)
-	return nil
+func (bm *BufferManager) MarkDirty(fid uint32, pid page.PageID) {
+	bm.pool.MarkDirty(fid, pid)
 }
 
 /*
-FlushTable writes every dirty page belonging to schema.table.
+FlushTable flushes all dirty pages for this specific table.
 */
 func (bm *BufferManager) FlushTable(schema, table string) error {
-	pool, err := bm.getPool(schema, table)
+	fid, fm, err := bm.tm.OpenTable(schema, table)
 	if err != nil {
 		return err
 	}
-	return pool.FlushAll()
+
+	writeFn := func(fileID uint32, p *page.Page) error {
+		if fileID != fid {
+			return nil // skip pages from other files
+		}
+		return fm.WritePage(p)
+	}
+
+	syncFn := func(fileID uint32) error {
+		if fileID == fid {
+			return fm.Sync()
+		}
+		return nil
+	}
+
+	return bm.pool.FlushAll(writeFn, syncFn)
+}
+
+/*
+FlushAll flushes all dirty pages across ALL FileManagers.
+*/
+func (bm *BufferManager) FlushAll() error {
+	writeFn := func(fid uint32, p *page.Page) error {
+		fm, ok := bm.tm.LookupByFileID(fid)
+		if !ok {
+			return fmt.Errorf("buffer: missing FileManager for fid=%d", fid)
+		}
+		return fm.WritePage(p)
+	}
+
+	syncFn := func(fid uint32) error {
+		fm, ok := bm.tm.LookupByFileID(fid)
+		if !ok {
+			return fmt.Errorf("buffer: missing FileManager for fid=%d", fid)
+		}
+		return fm.Sync()
+	}
+
+	return bm.pool.FlushAll(writeFn, syncFn)
 }

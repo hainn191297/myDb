@@ -1,177 +1,190 @@
 package heap
 
 import (
-	"errors"
 	"fmt"
 
 	"github.com/hainn191297/myDb/internal/storage/engine"
 	"github.com/hainn191297/myDb/internal/storage/page"
 )
 
-// RecordID uniquely identifies a tuple (pageID + slot index).
-type RecordID struct {
-	Page page.PageID
-	Slot uint16
-}
+/*
+Table represents one heap-organized table file.
 
+It does NOT know schema of tuples; it only stores opaque []byte blobs
+(encoding/decoding is handled by tuple.go / heap engine).
+
+Responsibilities:
+  - choose a page with enough free space for inserts
+  - allocate new pages when needed
+  - iterate over all tuples (full scan)
+  - delete tuple by (pageID, slotIdx)
+*/
 type Table struct {
-	Schema string
-	Name   string
+	schema string
+	name   string
 
-	bufMgr *engine.BufferManager
+	tm *engine.TableManager
+	bm *engine.BufferManager
 }
 
-func NewTable(schema, name string, bm *engine.BufferManager) *Table {
+// NewTable creates a heap table handle bound to a schema/table name.
+func NewTable(schema, name string, tm *engine.TableManager, bm *engine.BufferManager) *Table {
 	return &Table{
-		Schema: schema,
-		Name:   name,
-		bufMgr: bm,
+		schema: schema,
+		name:   name,
+		tm:     tm,
+		bm:     bm,
 	}
 }
 
-func (t *Table) Insert(payload []byte) (RecordID, error) {
-	if len(payload) == 0 {
-		return RecordID{}, fmt.Errorf("heap: empty payload")
-	}
+/*
+Insert appends a new tuple into this heap table.
 
-	tm := t.bufMgr.TableManager()
-	fm, err := tm.OpenTable(t.Schema, t.Name)
+It scans existing pages for enough free space; if none found,
+it allocates a new physical page via FileManager, initializes it
+as an empty heap page, and inserts there.
+
+RETURN:
+  - pageID where tuple is stored
+  - slot index inside that page
+*/
+func (t *Table) Insert(tuple []byte) (page.PageID, int, error) {
+	// Open underlying file to know how many pages exist
+	fid, fm, err := t.tm.OpenTable(t.schema, t.name)
 	if err != nil {
-		return RecordID{}, err
+		return 0, -1, err
 	}
 
-	totalPages, err := fm.NumPages()
+	numPages, err := fm.NumPages()
 	if err != nil {
-		return RecordID{}, err
-	}
-	if totalPages == 0 {
-		if _, err := t.allocateNewPage(fm); err != nil {
-			return RecordID{}, err
-		}
-		totalPages = 1
+		return 0, -1, fmt.Errorf("heap: NumPages failed: %w", err)
 	}
 
-	for pid := page.PageID(1); pid <= page.PageID(totalPages); pid++ {
-		pg, err := t.bufMgr.GetPage(t.Schema, t.Name, pid)
+	// Try to find an existing page with enough free space
+	for pid := page.PageID(1); pid <= page.PageID(numPages); pid++ {
+		_, raw, err := t.bm.GetPage(t.schema, t.name, pid)
 		if err != nil {
-			return RecordID{}, err
+			return 0, -1, fmt.Errorf("heap: GetPage(%d): %w", pid, err)
 		}
 
-		if !pageInitialized(pg) {
-			initPage(pg)
-			t.bufMgr.MarkDirty(t.Schema, t.Name, pid)
-		}
+		hp := WrapPage(raw)
+		need := len(tuple) + 2 // tuple bytes + 1 slot entry (2 bytes)
 
-		slot, err := insertTuple(pg, payload)
-		if err == nil {
-			t.bufMgr.MarkDirty(t.Schema, t.Name, pid)
-			t.bufMgr.Unpin(t.Schema, t.Name, pid)
-			return RecordID{Page: pid, Slot: slot}, nil
-		}
-		t.bufMgr.Unpin(t.Schema, t.Name, pid)
-		if !errors.Is(err, errNoSpace) {
-			return RecordID{}, err
-		}
-	}
-
-	newPID, err := t.allocateNewPage(fm)
-	if err != nil {
-		return RecordID{}, err
-	}
-
-	pg, err := t.bufMgr.GetPage(t.Schema, t.Name, newPID)
-	if err != nil {
-		return RecordID{}, err
-	}
-	if !pageInitialized(pg) {
-		initPage(pg)
-	}
-	slot, err := insertTuple(pg, payload)
-	if err != nil {
-		t.bufMgr.Unpin(t.Schema, t.Name, newPID)
-		return RecordID{}, err
-	}
-	t.bufMgr.MarkDirty(t.Schema, t.Name, newPID)
-	t.bufMgr.Unpin(t.Schema, t.Name, newPID)
-	return RecordID{Page: newPID, Slot: slot}, nil
-}
-
-func (t *Table) allocateNewPage(fm *page.FileManager) (page.PageID, error) {
-	pid, err := fm.AllocatePage()
-	if err != nil {
-		return 0, err
-	}
-	p := page.NewPage(fmt.Sprintf("%s.%s", t.Schema, t.Name), pid)
-	initPage(p)
-	if err := fm.WritePage(p); err != nil {
-		return 0, err
-	}
-	return pid, nil
-}
-
-// Delete marks the slot empty so space can be reused later.
-func (t *Table) Delete(rid RecordID) error {
-	pg, err := t.bufMgr.GetPage(t.Schema, t.Name, rid.Page)
-	if err != nil {
-		return err
-	}
-	defer t.bufMgr.Unpin(t.Schema, t.Name, rid.Page)
-
-	slots, _, _ := readHeader(pg)
-	if rid.Slot >= slots {
-		return fmt.Errorf("heap: slot %d out of range", rid.Slot)
-	}
-
-	slot := getSlot(pg, rid.Slot)
-	if slot.Length == 0 {
-		return fmt.Errorf("heap: record already deleted")
-	}
-
-	clearSlot(pg, rid.Slot)
-	t.bufMgr.MarkDirty(t.Schema, t.Name, rid.Page)
-	return nil
-}
-
-// Scan iterates all tuples in page-slot order.
-func (t *Table) Scan(fn func(RecordID, []byte) bool) error {
-	tm := t.bufMgr.TableManager()
-	fm, err := tm.OpenTable(t.Schema, t.Name)
-	if err != nil {
-		return err
-	}
-
-	totalPages, err := fm.NumPages()
-	if err != nil {
-		return err
-	}
-
-	for pid := page.PageID(1); pid <= page.PageID(totalPages); pid++ {
-		pg, err := t.bufMgr.GetPage(t.Schema, t.Name, pid)
-		if err != nil {
-			return err
-		}
-
-		if !pageInitialized(pg) {
-			t.bufMgr.Unpin(t.Schema, t.Name, pid)
-			continue
-		}
-
-		stop := false
-		iterateSlots(pg, func(slotID int, data []byte) bool {
-			buf := make([]byte, len(data))
-			copy(buf, data)
-			cont := fn(RecordID{Page: pid, Slot: uint16(slotID)}, buf)
-			if !cont {
-				stop = true
+		if hp.FreeSpace() >= need {
+			slot, ierr := hp.InsertTuple(tuple)
+			// mark page dirty & unpin
+			t.bm.Unpin(fid, pid, ierr == nil)
+			if ierr != nil {
+				return 0, -1, ierr
 			}
-			return cont
+			return pid, slot, nil
+		}
+
+		// not enough space: unpin clean
+		t.bm.Unpin(fid, pid, false)
+	}
+
+	// No existing page has room → allocate a new page
+	newPID, err := fm.AllocatePage()
+	if err != nil {
+		return 0, -1, fmt.Errorf("heap: allocate page failed: %w", err)
+	}
+
+	// initialize as empty heap page and persist initial header
+	hp := NewEmptyPage(newPID)
+	if err := fm.WritePage(hp.Raw()); err != nil {
+		return 0, -1, fmt.Errorf("heap: write new page %d: %w", newPID, err)
+	}
+
+	// load via buffer manager so buffer pool knows about it
+	_, raw, err := t.bm.GetPage(t.schema, t.name, newPID)
+	if err != nil {
+		return 0, -1, fmt.Errorf("heap: GetPage(new %d): %w", newPID, err)
+	}
+	hp2 := WrapPage(raw)
+
+	slot, ierr := hp2.InsertTuple(tuple)
+	t.bm.Unpin(fid, newPID, ierr == nil)
+	if ierr != nil {
+		return 0, -1, ierr
+	}
+
+	return newPID, slot, nil
+}
+
+/*
+Scan calls fn(pid, slotIdx, offset) for every LIVE tuple in the table.
+
+- pid      = physical page ID
+- slotIdx  = slot index within that page
+- offset   = byte offset inside the page where tuple bytes begin
+
+fn can return false to stop early (for e.g. point lookups).
+
+Decoding of tuple bytes is handled at a higher layer (tuple.go).
+*/
+func (t *Table) Scan(fn func(pid page.PageID, slot int, offset uint16, pg *page.Page) bool) error {
+	// Need NumPages() → ask underlying FileManager
+	fid, fm, err := t.tm.OpenTable(t.schema, t.name)
+	if err != nil {
+		return err
+	}
+
+	numPages, err := fm.NumPages()
+	if err != nil {
+		return fmt.Errorf("heap: NumPages failed: %w", err)
+	}
+
+	for pid := page.PageID(1); pid <= page.PageID(numPages); pid++ {
+		_, raw, err := t.bm.GetPage(t.schema, t.name, pid)
+		if err != nil {
+			return fmt.Errorf("heap: GetPage(%d): %w", pid, err)
+		}
+
+		hp := WrapPage(raw)
+		stop := false
+
+		hp.ForEach(func(slot int, off uint16) bool {
+			if !fn(pid, slot, off, raw) {
+				stop = true
+				return false
+			}
+			return true
 		})
-		t.bufMgr.Unpin(t.Schema, t.Name, pid)
+
+		// this page may be read-only during scan
+		t.bm.Unpin(fid, pid, false)
 
 		if stop {
 			break
 		}
 	}
 
+	return nil
+}
+
+/*
+Delete deletes a tuple by (pageID, slotIdx).
+
+This only marks the slot as free on that page (no compaction yet).
+*/
+func (t *Table) Delete(pid page.PageID, slot int) error {
+	fid, _, err := t.tm.OpenTable(t.schema, t.name)
+	if err != nil {
+		return err
+	}
+
+	_, raw, err := t.bm.GetPage(t.schema, t.name, pid)
+	if err != nil {
+		return fmt.Errorf("heap: GetPage(%d): %w", pid, err)
+	}
+
+	hp := WrapPage(raw)
+	if err := hp.DeleteTuple(slot); err != nil {
+		t.bm.Unpin(fid, pid, false)
+		return err
+	}
+
+	t.bm.Unpin(fid, pid, true)
 	return nil
 }

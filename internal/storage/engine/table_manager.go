@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,91 +10,114 @@ import (
 )
 
 /*
-TableManager encapsulates filesystem layout rules for schemas/tables.
+TableManager handles:
 
-Responsibilities:
-- ensure schema directories exist under basePath
-- map each logical table to a single data file <schema>/<table>.db
-- cache open FileManagers for reuse
+- schema directory creation
+- mapping (schema.table) → FileManager
+- assigning FileID (unique int for global buffer pool)
 */
 type TableManager struct {
-	basePath string // e.g., "data/"
+	basePath string
 
-	mu     sync.Mutex
-	tables map[string]*page.FileManager
+	mu       sync.Mutex
+	nextFID  uint32 // next FileID
+	byName   map[string]*page.FileManager
+	byFileID map[uint32]*page.FileManager
 }
 
 func NewTableManager(basePath string) *TableManager {
 	return &TableManager{
 		basePath: basePath,
-		tables:   make(map[string]*page.FileManager),
+		nextFID:  1,
+		byName:   make(map[string]*page.FileManager),
+		byFileID: make(map[uint32]*page.FileManager),
 	}
 }
 
-/*
-CreateSchema ensures the schema directory exists (idempotent).
-*/
+// CreateSchema ensures "basePath/schema/" exists.
 func (tm *TableManager) CreateSchema(schema string) error {
-	return os.MkdirAll(filepath.Join(tm.basePath, schema), 0755)
+	return os.MkdirAll(filepath.Join(tm.basePath, schema), 0o755)
+}
+
+// tableKey → "schema.table"
+func tableKey(schema, table string) string {
+	return schema + "." + table
 }
 
 /*
-OpenTable lazily creates (if needed) and caches a FileManager bound to
-data/<schema>/<table>.db so higher layers can read/write pages.
-*/
-func (tm *TableManager) OpenTable(schema, table string) (*page.FileManager, error) {
-	key := tm.tableKey(schema, table)
+OpenTable returns:
 
+- FileID (uint32)
+- *FileManager
+
+Caches FileManager in memory so multiple engines or scans share the same FD.
+*/
+func (tm *TableManager) OpenTable(schema, table string) (uint32, *page.FileManager, error) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
-	if fm, ok := tm.tables[key]; ok {
-		return fm, nil
+	key := tableKey(schema, table)
+
+	// cached?
+	if fm, ok := tm.byName[key]; ok {
+		// find FileID from byFileID
+		for fid, ref := range tm.byFileID {
+			if ref == fm {
+				return fid, fm, nil
+			}
+		}
+		// Should not happen
+		return 0, nil, fmt.Errorf("tm: fileID missing for table %s", key)
 	}
 
+	// ensure schema directory exists
 	dir := filepath.Join(tm.basePath, schema)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return nil, err
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return 0, nil, err
 	}
 
-	file := filepath.Join(dir, table+".db")
-	fm, err := page.NewFileManager(file)
+	// open file
+	path := filepath.Join(dir, table+".db")
+	fm, err := page.NewFileManager(path)
 	if err != nil {
-		return nil, err
+		return 0, nil, err
 	}
 
-	tm.tables[key] = fm
-	return fm, nil
+	// assign new FileID
+	fid := tm.nextFID
+	tm.nextFID++
+
+	// cache
+	tm.byName[key] = fm
+	tm.byFileID[fid] = fm
+
+	return fid, fm, nil
 }
 
-/*
-CreateTable is kept for backward compatibility and proxies to OpenTable.
-*/
-func (tm *TableManager) CreateTable(schema, table string) (*page.FileManager, error) {
-	return tm.OpenTable(schema, table)
+// LookupByFileID returns FileManager by FileID (used by BufferManager flush)
+func (tm *TableManager) LookupByFileID(fid uint32) (*page.FileManager, bool) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	fm, ok := tm.byFileID[fid]
+	return fm, ok
 }
 
-/*
-Close releases all cached FileManagers.
-*/
+// Close closes every FileManager
 func (tm *TableManager) Close() error {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
-	var errs []error
-	for key, fm := range tm.tables {
+	var lastErr error
+	for fid, fm := range tm.byFileID {
 		if err := fm.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", key, err))
+			lastErr = err
 		}
-		delete(tm.tables, key)
+		delete(tm.byFileID, fid)
 	}
 
-	if len(errs) > 0 {
-		return errors.Join(errs...)
+	for key := range tm.byName {
+		delete(tm.byName, key)
 	}
-	return nil
-}
 
-func (tm *TableManager) tableKey(schema, table string) string {
-	return schema + "." + table
+	return lastErr
 }
