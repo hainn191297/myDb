@@ -35,7 +35,7 @@ func NewBufferManager(tm *TableManager, pool *buffer.GlobalPool, walLogger wal.L
 GetPage returns (fileID, *Page):
 
   - TableManager.OpenTable → (fid, fm)
-  - GlobalPool.GetPage(fid, pid, reader)
+  - GlobalPool.GetPage(fid, pid, reader, writer)
 */
 func (bm *BufferManager) GetPage(
 	schema, table string,
@@ -50,8 +50,11 @@ func (bm *BufferManager) GetPage(
 	reader := func(pid page.PageID) (*page.Page, error) {
 		return fm.ReadPage(pid)
 	}
+	writer := func(p *page.Page) error {
+		return fm.WritePage(p)
+	}
 
-	pg, err := bm.pool.GetPage(fid, pid, reader)
+	pg, err := bm.pool.GetPage(fid, pid, reader, writer)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -87,20 +90,18 @@ func (bm *BufferManager) FlushTable(schema, table string) error {
 	}
 
 	writeFn := func(fileID uint32, p *page.Page) error {
-		if fileID != fid {
-			return nil // skip pages from other files
-		}
 		return fm.WritePage(p)
 	}
 
 	syncFn := func(fileID uint32) error {
-		if fileID == fid {
-			return fm.Sync()
-		}
-		return nil
+		return fm.Sync()
 	}
 
-	return bm.pool.FlushAll(writeFn, syncFn)
+	filter := func(fileID uint32) bool {
+		return fileID == fid
+	}
+
+	return bm.pool.FlushMatching(filter, writeFn, syncFn)
 }
 
 /*
