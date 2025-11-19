@@ -1,5 +1,5 @@
 @startuml
-title Buffer Manager & Buffer Pool Lifecycle
+title Buffer Manager & Global Buffer Pool
 
 skinparam {
     shadowing false
@@ -11,124 +11,106 @@ skinparam {
 actor "Client Query" as Client
 participant "Buffer Manager" as BM
 participant "Table Manager" as TM
-participant "WAL Manager" as WM
-participant "Buffer Pool\n(per FileManager)" as BP
-participant "Page Table\n(PageID -> Frame)" as PT
-participant "Frame / Slot" as Frame
-participant "Free List\n(preallocated frames)" as FreeList
+participant "Global Buffer Pool" as GP
+participant "Page Map\n(FileID,PageID -> Frame)" as PT
 participant "LRU List" as LRU
-participant "FileManager\n(table.db)" as FM
+participant "Free List" as FreeList
+participant "Frame" as Frame
+participant "FileManager" as FM
 participant "WAL Logger" as WAL
 database "Disk (table.db)" as Disk
 database "WAL File" as WALFile
 
-note right of BM
-  BufferManager keeps a per-table registry:
-  - lookup existing pool (schema.table)
-  - open FileManager via TableManager if needed
-  - obtain WAL logger via WAL Manager
-  - create BufferPool(capacity, FM, WAL) on first use
+note right of GP
+  One shared GlobalPool serves every table.
+  Frames keep:
+    - FileID + PageID
+    - dirty flag / pin count
+    - writer closure bound to the FileManager
+  Eviction/WAL logic is centralized so all
+  storage engines observe the same cache.
 end note
 
 note right of FreeList
-  Frames are preallocated at startup.
-  They cover the first `capacity` misses.
-  After that, evicted frames are reused directly.
+  Frames are preallocated. Misses use
+  the free list first; afterwards evicted
+  frames are recycled.
 end note
 
-note right of BP
-  Each BufferPool instance owns the
-  FileManager provided by BufferManager/
-  TableManager and appends to WAL before
-  writing dirty frames to disk.
-end note
+== Load Page ==
 
-== Buffer Manager Lookup ==
-
-Client -> BM: GetPage(schema, table, PageID)
-BM -> BM: poolKey = schema.table
-
-alt Pool cached
-    BM -> BM: reuse existing BufferPool
-else Pool missing
-    BM -> TM: OpenTable(schema, table)
-    TM --> BM: FileManager
-    alt WAL enabled
-        BM -> WM: Open(schema, table)
-        WM --> BM: WAL Logger
-    else No WAL configured
-        BM -> BM: use nil logger
-    end
-    BM -> BM: create BufferPool(capacity, FM, WAL)\nstore in map
-end
-
-BM -> BP: Get(PageID)
-BP -> PT: Lookup PageID
+Client -> BM: GetPage(schema, table, pid)
+BM -> TM: OpenTable(schema, table)
+TM --> BM: (FileID, *FileManager)
+BM -> GP: GetPage(fid, pid,\nreader=fm.ReadPage,\nwriter=fm.WritePage)
+GP -> PT: Lookup (fid,pid)
 
 alt Cache Hit
-    PT --> BP: frame
-    BP -> Frame: pinCnt++
-    BP -> LRU: MoveToFront(frame)
-    BP --> BM: Page (HIT)
+    PT --> GP: frame
+    GP -> Frame: pinCnt++
+    GP -> LRU: MoveToFront(frame)
+    GP --> BM: *page.Page
 else Cache Miss
-    PT --> BP: missing
-
-    alt FreeList has frame
-        BP -> FreeList: Pop frame
-    else Buffer full
-        BP -> LRU: Select victim (tail)
-        loop Scan until unpinned
-            alt Victim pinned
-                LRU --> BP: pinCnt > 0
-                BP -> LRU: continue
-            else Victim unpinned
+    PT --> GP: missing
+    alt FreeList available
+        GP -> FreeList: Pop frame
+    else Need eviction
+        GP -> LRU: pick tail
+        loop until frame unpinned
+            alt frame pinned
+                LRU --> GP: pinCnt > 0
+                GP -> LRU: continue
+            else unpinned
                 alt Dirty
-                    BP -> WAL: Append(table, PageID, data)
+                    GP -> WAL: Append(fid,pid,data)
                     WAL -> WALFile: append
-                    BP -> FM: WritePage(victim.Page)
-                    FM -> Disk: write block
+                    GP -> Frame: call writer(Page)\n(write via FileManager)
                 else Clean
-                    BP -> BP: skip flush
+                    GP -> GP: reuse directly
                 end
-                BP -> PT: Remove PageID
-                BP -> LRU: Remove victim node
-                BP -> Frame: Reset (Page=nil, Dirty=false, pinCnt=0)
+                GP -> PT: Remove (fid,pid)
+                GP -> LRU: Remove node
+                GP -> Frame: Reset metadata
                 break
             end
         end
     end
 
-    BP -> FM: ReadPage(PageID)
+    GP -> FM: reader(pid)
     FM -> Disk: read block
     Disk --> FM: bytes
-    FM --> BP: Page data
+    FM --> GP: *page.Page
 
-    BP -> Frame: Load data\npinCnt=1\nDirty=false
-    BP -> LRU: Insert at front
-    BP -> PT: Insert PageID -> frame
-    BP --> BM: Page (MISS)
+    GP -> Frame: assign page, fid, pid,\npinCnt=1, Dirty=false,\nwriter=FM.WritePage
+    GP -> LRU: Insert at front
+    GP -> PT: Insert (fid,pid) -> frame
+    GP --> BM: *page.Page
 end
 
-BM --> Client: Page
+BM --> Client: page pointer
 
-== Mark Dirty ==
-Client -> BM: MarkDirty(schema, table, PageID)
-BM -> BP: MarkDirty(PageID)
-BP -> Frame: Dirty=true
+== Mark Dirty / Unpin ==
 
-== Unpin ==
-Client -> BM: Unpin(schema, table, PageID)
-BM -> BP: Unpin(PageID)
-BP -> Frame: pinCnt--
+Client -> BM: Unpin(schema, table, pid, dirty?)
+BM --> GP: Unpin(fid, pid, dirty)
+GP -> Frame: pinCnt--\nDirty |= dirty
 
-== FlushAll ==
+Client -> BM: MarkDirty(schema, table, pid)
+BM -> GP: MarkDirty(fid, pid)
+
+== Flush ==
+
 Client -> BM: FlushTable(schema, table)
-BM -> BP: FlushAll()
-BP -> Frame: For each dirty page
-BP -> WAL: Append()
-WAL -> WALFile: append
-BP -> WAL: Sync()
-BP -> FM: WritePage()
-BP -> FM: Sync()
+BM -> GP: FlushMatching(filter=fid,\nwrite=fm.WritePage,\nsync=fm.Sync)
+loop for each dirty frame matching fid
+    GP -> WAL: Append(fid,pid,data)
+    WAL -> WALFile: append
+    GP -> GP: WAL.Sync once
+    GP -> Frame: writer(Page)\n(write via FileManager)
+end
+GP -> FM: Sync()
+
+Client -> BM: FlushAll()
+BM -> GP: FlushMatching(filter=nil,\nwrite=Lookup(fid).WritePage,\nsync=Lookup(fid).Sync)
 
 @enduml
