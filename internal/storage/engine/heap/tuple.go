@@ -3,11 +3,17 @@ package heap
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 )
 
 // encodeTuple serializes key/value into [keyLen][valLen][key][value].
 func encodeTuple(key, value []byte) []byte {
-	buf := make([]byte, 8+len(key)+len(value))
+	const maxTupleSize = 64 * 1024 * 1024 // 64 MB, adjust as reasonable for your app
+	tupleLen := 8 + len(key) + len(value)
+	if len(key) < 0 || len(value) < 0 || tupleLen < 0 || tupleLen > maxTupleSize || tupleLen > math.MaxInt {
+		panic(fmt.Sprintf("encodeTuple: tuple too large (key=%d, value=%d, total=%d)", len(key), len(value), tupleLen))
+	}
+	buf := make([]byte, tupleLen)
 	binary.LittleEndian.PutUint32(buf[0:4], uint32(len(key)))
 	binary.LittleEndian.PutUint32(buf[4:8], uint32(len(value)))
 	copy(buf[8:8+len(key)], key)
