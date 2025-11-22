@@ -8,6 +8,8 @@ type Config struct {
 	GRPCPort          int
 	MaxSessions       int
 	IdleSessionExpiry time.Duration
+	DataDir           string
+	BufferPoolPages   int
 }
 
 // Load returns default configuration. Later this will consult files/env/etcd.
@@ -16,5 +18,7 @@ func Load() Config {
 		GRPCPort:          7000,
 		MaxSessions:       128,
 		IdleSessionExpiry: 5 * time.Minute,
+		DataDir:           "data",
+		BufferPoolPages:   64,
 	}
 }

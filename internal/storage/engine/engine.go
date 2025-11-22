@@ -13,6 +13,14 @@ type Engine interface {
 	Scan(ctx context.Context, start, end []byte) (Iterator, error)
 }
 
+// IndexEngine describes the interface for index storage (e.g. B+ Tree).
+type IndexEngine interface {
+	Insert(key, value []byte) error
+	Search(key []byte) ([]byte, bool, error)
+	Delete(key []byte) error
+	RangeScan(ctx context.Context, start, end []byte) (Iterator, error)
+}
+
 // Iterator streams key/value pairs in order.
 type Iterator interface {
 	Next() bool

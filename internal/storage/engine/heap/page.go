@@ -23,7 +23,6 @@ Slot directory entry i (0-based):
 
 NOTE:
 - We do NOT store tuple length here. Tuple encoding (len, columns, etc.)
-  thuộc về layer tuple.go – ở đây chỉ quản lý vị trí trong page.
 - Xoá slot chỉ đánh dấu slot offset = 0xFFFF; chưa compact free space.
 */
 
