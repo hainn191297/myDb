@@ -1,0 +1,185 @@
+@startuml server_session_flow
+title Server and Session Management Flow
+
+skinparam {
+    shadowing false
+    ArrowColor #555
+    ParticipantFontSize 12
+}
+
+actor "Client" as Client
+participant "gRPC Server" as gRPC
+participant "Server\\n(internal/server/)" as Server
+participant "Session Manager" as SessionMgr
+participant "Parser" as Parser
+participant "Planner" as Planner
+participant "Executor" as Executor
+participant "Txn Manager" as TxnMgr
+
+note right of gRPC
+  **gRPC API** (api/proto/mydb.proto)
+  
+  Services:
+  - ExecuteSQL(sql, sessionID) → ExecuteSQLResponse
+  - GetMetadata(request) → GetMetadataResponse
+  
+  Results:
+  - QueryResult (SELECT - rows + columns)
+  - CommandResult (INSERT/UPDATE/DELETE - rowsAffected)
+  - ErrorResult (errors)
+end note
+
+note right of SessionMgr
+  **Session Manager**
+  (internal/server/session/)
+  
+  - Create session with unique ID
+  - Track transaction state per session
+  - Session timeout handling
+  - Thread-safe session map
+end note
+
+== Server Startup ==
+
+gRPC -> Server: Start(ctx)
+Server -> Server: Initialize\\n- Config (DataDir, GRPCPort)\\n- SessionManager\\n- TxnManager\\n- Catalog\\n- Provider
+
+Server -> gRPC: Listen on :7001
+note right: Server ready for connections
+
+== Client Connection & First Query ==
+
+Client -> gRPC: ExecuteSQL(\\n  sql="CREATE TABLE users (...)",\\n  sessionID=""\\n)
+
+gRPC -> Server: ExecuteSQL(ctx, request)
+
+Server -> SessionMgr: GetOrCreate(sessionID)
+
+alt SessionID empty or not found
+    SessionMgr -> SessionMgr: Generate new ID\\n(timestamp-based)
+    SessionMgr -> SessionMgr: sessions[id] = Session{\\n  ID: id,\\n  CreatedAt: now,\\n  Txn: nil\\n}
+    SessionMgr --> Server: Session{ID: "20251124T133700.123456"}
+else SessionID exists
+    SessionMgr -> SessionMgr: Lookup in map
+    SessionMgr --> Server: existing Session
+end
+
+Server -> Server: sessionID = session.ID
+
+Server -> Parser: Parse(sql)
+Parser --> Server: AST
+
+Server -> Planner: Build(ast, catalog)
+Planner --> Server: Plan
+
+Server -> Executor: New(plan, Options{\\n  TxnManager: txnMgr,\\n  SessionTxn: \u0026SessionTxn{Current: session.Txn},\\n  Provider: provider,\\n  Catalog: catalog\\n})
+
+Server -> Server: Execute and format response
+
+alt SELECT query
+    Server -> Executor: Next()
+    loop While has rows
+        Executor --> Server: Row
+        Server -> Server: Collect rows
+    end
+    
+    Server -> Server: formatQueryResult(executor)
+    Server --> gRPC: ExecuteSQLResponse{\\n  SessionId: sessionID,\\n  Result: QueryResult{\\n    Columns: ["id", "name"],\\n    Rows: [...]\\n  }\\n}
+    
+else DML (INSERT/UPDATE/DELETE)
+    Server -> Executor: Next()
+    Executor --> Server: complete
+    
+    Server -> Server: formatCommandResult(executor, stmtType)
+    Server --> gRPC: ExecuteSQLResponse{\\n  SessionId: sessionID,\\n  Result: CommandResult{\\n    RowsAffected: 1\\n  }\\n}
+    
+else DDL (CREATE TABLE, etc)
+    Server -> Executor: Next()
+    Executor --> Server: complete
+    
+    Server -> Server: formatCommandResult
+    Server --> gRPC: ExecuteSQLResponse{\\n  SessionId: sessionID,\\n  Result: CommandResult{\\n    Message: "Table created"\\n  }\\n}
+    
+else Transaction control
+    Server -> Executor: executeTxn(TxnOp)
+    
+    alt BEGIN
+        Executor -> TxnMgr: Begin()
+        TxnMgr --> Executor: TxnState{ID, Status}
+        Executor -> SessionMgr: session.Txn = txnState
+    else COMMIT
+        Executor -> TxnMgr: Commit(session.Txn.ID)
+        TxnMgr --> Executor: ok
+        Executor -> SessionMgr: session.Txn = nil
+    else ROLLBACK
+        Executor -> TxnMgr: Rollback(session.Txn.ID)
+        TxnMgr --> Executor: ok
+        Executor -> SessionMgr: session.Txn = nil
+    end
+    
+    Server --> gRPC: CommandResult
+    
+else Error
+    Server -> Server: formatErrorResult
+    Server --> gRPC: ExecuteSQLResponse{\\n  SessionId: sessionID,\\n  Result: ErrorResult{\\n    Message: "syntax error",\\n    Code: "SYNTAX_ERROR"\\n  }\\n}
+end
+
+gRPC --> Client: Response
+
+== Subsequent Query with Session ==
+
+Client -> gRPC: ExecuteSQL(\\n  sql="INSERT INTO users VALUES (...)",\\n  sessionID="20251124T133700.123456"\\n)
+
+gRPC -> Server: ExecuteSQL(ctx, request)
+Server -> SessionMgr: GetOrCreate(sessionID)
+SessionMgr -> SessionMgr: Lookup existing session
+SessionMgr --> Server: Session (reused)
+
+note right of Server
+  **Session Reuse:**
+  - Maintains transaction state
+  - No re-authentication needed
+  - Efficient for multiple queries
+end note
+
+Server -> Server: Process query as before...
+Server --> Client: Response with same sessionID
+
+== GetMetadata Query ==
+
+Client -> gRPC: GetMetadata(\\n  schema="public",\\n  table="users"\\n)
+
+gRPC -> Server: GetMetadata(ctx, request)
+
+Server -> Server: catalog.GetTable(schema, table)
+
+alt Table found
+    Server -> Server: Build TableInfo{\\n  Name, Schema,\\n  Columns: [{Name, Type, NotNull, PrimaryKey}]\\n}
+    
+    Server -> Server: catalog.GetIndexes(schema, table)
+    Server -> Server: Build IndexInfo list
+    
+    Server --> gRPC: GetMetadataResponse{\\n  Table: TableInfo,\\n  Indexes: [IndexInfo]\\n}
+else Table not found
+    Server --> gRPC: GetMetadataResponse{\\n  Error: "table not found"\\n}
+end
+
+gRPC --> Client: Metadata response
+
+== Session State Management ==
+
+note over SessionMgr
+  **Session Lifecycle:**
+  
+  1. Created on first request (or explicit sessionID)
+  2. Maintains:
+     - Current transaction (if any)
+     - Created timestamp
+     - Last access time (future)
+  3. Cleanup:
+     - Timeout-based expiration (future)
+     - Explicit close (future)
+  4. Thread-safe with mutex
+end note
+
+@enduml

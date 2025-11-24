@@ -18,3 +18,7 @@ build/
 # go cache
 .gocache/
 .qodo/
+
+.internal/sql/executor/testdata
+
+test/e2e/test_data_e2e

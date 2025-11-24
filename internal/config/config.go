@@ -15,7 +15,7 @@ type Config struct {
 // Load returns default configuration. Later this will consult files/env/etcd.
 func Load() Config {
 	return Config{
-		GRPCPort:          7000,
+		GRPCPort:          7001,
 		MaxSessions:       128,
 		IdleSessionExpiry: 5 * time.Minute,
 		DataDir:           "data",

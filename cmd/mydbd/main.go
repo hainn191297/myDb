@@ -8,12 +8,14 @@ import (
 	"syscall"
 
 	"github.com/hainn191297/myDb/internal/config"
+	"github.com/hainn191297/myDb/internal/logging"
 	"github.com/hainn191297/myDb/internal/server"
 )
 
 func main() {
 	cfg := config.Load()
 
+	logging.Infof("myDb booting with data dir %s", cfg.DataDir)
 	srv, err := server.New(cfg)
 	if err != nil {
 		log.Fatalf("init server: %v", err)
@@ -34,6 +36,7 @@ func signalContext() (context.Context, context.CancelFunc) {
 	go func() {
 		select {
 		case <-sigCh:
+			logging.Warnf("received shutdown signal")
 			cancel()
 		case <-ctx.Done():
 		}

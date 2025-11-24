@@ -1,0 +1,264 @@
+@startuml storage_complete_flow
+title Complete Storage Layer Flow - From Query to Disk
+
+skinparam {
+    shadowing false
+    ArrowColor #555
+    ParticipantFontSize 11
+}
+
+actor "Executor" as Exec
+participant "Provider" as Provider
+participant "Heap Engine" as Heap
+participant "B+Tree Engine" as BTree
+participant "Buffer Manager" as BM
+participant "Table Manager" as TM
+participant "Global Pool" as GP
+participant "WAL Manager" as WALM
+participant "WAL Logger" as WAL
+participant "File Manager" as FM
+database "Data File\\n(users.db)" as DataFile
+database "Index File\\n(users__pk.db)" as IndexFile
+database "WAL File\\n(users.wal)" as WALFile
+
+note right of Provider
+  **Storage Provider**
+  (internal/storage/provider/)
+  
+  - Resolves Engine(schema, table) → HeapEngine
+  - Resolves Index(schema, table, indexName) → BTreeEngine
+  - Manages catalog persistence
+end note
+
+== INSERT Flow: Data + Index ==
+
+Exec -> Provider: Engine("public", "users")
+Provider -> Provider: Get or create HeapEngine\\nfor "public.users"
+Provider --> Exec: HeapEngine
+
+Exec -> Heap: Put(key=1, value=[Alice, 30])
+
+Heap -> TM: OpenTable("public", "users")
+TM -> TM: Get or create FileManager\\nfor "public/users.db"
+TM --> Heap: (FileID=1, FileManager)
+
+Heap -> BM: GetPage("public", "users", pageID=1)
+
+BM -> TM: OpenTable (to get fid)
+TM --> BM: FileID=1
+
+BM -> GP: GetPage(fid=1, pid=1, reader, writer)
+
+alt Cache Hit
+    GP -> GP: Lookup in pageMap[1,1]
+    GP -> GP: frame.pinCnt++
+    GP -> GP: Move to LRU front
+    GP --> BM: Page (pinned)
+    
+else Cache Miss
+    GP -> GP: Check freeList or evict
+    
+    alt Need eviction
+        GP -> GP: Pick LRU tail (unpinned)
+        
+        alt Evicted frame is dirty
+            GP -> WALM: Open(schema="public", table="users")
+            WALM -> WAL: Get or create logger\\nfor "public/users.wal"
+            WALM --> GP: Logger
+            
+            GP -> WAL: Append(fid, pid, pageData)
+            WAL -> WALFile: Write log record:\\n[tableLen][schema.table][pid][dataLen][data]
+            WAL --> GP: ok
+            
+            GP -> WAL: Sync()
+            WAL -> WALFile: fsync
+            note right: **WAL durable!**
+            
+            GP -> FM: WritePage(page)
+            FM -> DataFile: Write 4KB block
+            FM --> GP: ok
+            
+            GP -> FM: Sync()
+            FM -> DataFile: fsync
+            note right: **Data durable!**
+        end
+        
+        GP -> GP: Remove from pageMap
+        GP -> GP: Remove from LRU
+    end
+    
+    GP -> FM: ReadPage(pid)
+    FM -> DataFile: Read 4KB block
+    DataFile --> FM: page bytes
+    FM --> GP: Page
+    
+    GP -> GP: Install in frame:\\n- fid=1, pid=1\\n- pinCnt=1, dirty=false\\n- writer=FM.WritePage
+    GP -> GP: Add to pageMap[1,1]
+    GP -> GP: Add to LRU front
+    GP --> BM: Page (pinned)
+end
+
+BM --> Heap: Page
+
+Heap -> Heap: WrapPage (slotted page)
+Heap -> Heap: Insert tuple into slot:\\n- Find free space\\n- Write tuple data\\n- Update slot directory
+
+Heap -> BM: Unpin(fid=1, pid=1, dirty=true)
+BM -> GP: Unpin(fid=1, pid=1, dirty=true)
+GP -> GP: frame.pinCnt--\\nframe.dirty = true
+
+note right of GP: Page marked dirty\\nwill be flushed eventually
+
+Heap --> Exec: Insert complete
+
+== Index Maintenance ==
+
+Exec -> Provider: Index("public", "users", "__pk_users_id")
+Provider -> Provider: Get or create BTreeEngine
+Provider --> Exec: BTreeEngine
+
+Exec -> BTree: Insert(key=1, value=location)
+
+BTree -> BTree: loadRoot()
+BTree -> BM: GetPage("public", "users__pk_users_id", rootPID=1)
+BM -> GP: GetPage(fid=2, pid=1, ...)
+GP --> BM: Root Page (pinned)
+BM --> BTree: Root Page
+
+BTree -> BTree: Traverse to leaf
+BTree -> BTree: Insert entry (key=1, val=location)
+
+alt Leaf has space
+    BTree -> BTree: writeLeaf(pg, entries)
+    BTree -> BM: Unpin(fid=2, pid=1, dirty=true)
+    
+else Leaf FULL - Split
+    BTree -> BTree: splitLeaf()
+    BTree -> FM: AllocatePage()
+    FM --> BTree: newPID=2
+    
+    BTree -> FM: WritePage(newPage) \\n(initialize empty)
+    FM -> IndexFile: Write empty page
+    
+    BTree -> BM: GetPage(fid=2, pid=2)
+    BM -> GP: GetPage (load just-written page)
+    GP --> BM: New Page
+    BM --> BTree: New Page
+    
+    BTree -> BTree: writeLeaf(newPg, right_half)
+    BTree -> BM: Unpin(fid=2, pid=2, dirty=true)
+    
+    BTree -> BTree: propagateSplit(path, promoteKey, newPID)
+    BTree -> BM: Unpin(fid=2, pid=1, dirty=true)
+end
+
+BTree --> Exec: Index insert complete
+
+== Flush on Commit or Eviction ==
+
+note over Exec: COMMIT transaction
+
+Exec -> BM: FlushTable("public", "users")
+BM -> GP: FlushMatching(filter=fid)
+
+loop For each dirty frame matching fid
+    GP -> WALM: Open("public", "users")
+    WALM --> GP: Logger
+    
+    GP -> WAL: Append(fid, pid, pageData)
+    WAL -> WALFile: Write log record
+end
+
+GP -> WAL: Sync() (once)
+WAL -> WALFile: fsync
+
+loop For each frame
+    GP -> FM: WritePage(page)
+    FM -> DataFile: Write 4KB
+end
+
+GP -> FM: Sync() (once)
+FM -> DataFile: fsync
+
+GP --> BM: Flush complete
+BM --> Exec: All dirty pages persisted
+
+note right of DataFile
+  **Durability Chain:**
+  1. Modify page in buffer (mark dirty)
+  2. On flush: WAL append
+  3. WAL fsync
+  4. Data write
+  5. Data fsync
+  
+  Crash recovery: replay WAL
+end note
+
+== SELECT with Index ==
+
+Exec -> Provider: Index("public", "users", "__pk_users_id")
+Provider --> Exec: BTreeEngine
+
+Exec -> BTree: Search(key=1)
+BTree -> BM: GetPage (traverse B+Tree)
+BM -> GP: GetPage (may hit cache!)
+GP --> BM: Page (from cache)
+BM --> BTree: Page
+
+BTree -> BTree: Binary search in leaf
+BTree --> Exec: (found=true, value=location)
+
+Exec -> Heap: GetByLocation(location)
+Heap -> Heap: Decode location →\\n(pageID=1, slotID=0)
+
+Heap -> BM: GetPage(pageID=1)
+BM -> GP: GetPage (cache hit!)
+GP --> BM: Page
+BM --> Heap: Page
+
+Heap -> Heap: GetTupleRegion(slotID)
+Heap -> Heap: Read tuple from slot
+Heap -> Heap: decodeTuple → value
+
+Heap -> BM: Unpin(pageID, dirty=false)
+Heap --> Exec: Row data [Alice, 30]
+
+Exec --> Exec: Project columns, return to client
+
+== Crash Recovery Startup ==
+
+note over WALM: **Server restart after crash**
+
+WALM -> WALM: Discover all *.wal files
+loop For each WAL file
+    WALM -> WAL: Open WAL file
+    
+    loop Read log records
+        WAL -> WAL: Parse record:\\n[tableLen][schema.table][pid][dataLen][data]
+        
+        WAL -> TM: OpenTable(schema, table)
+        TM --> WAL: FileManager
+        
+        WAL -> FM: WritePage(pid, data)
+        FM -> DataFile: Write recovered page
+        
+        note right: **Replay WAL record**
+    end
+    
+    WAL -> FM: Sync()
+    FM -> DataFile: fsync
+    
+    WAL -> WAL: Delete WAL file
+end
+
+WALM --> WALM: Recovery complete
+
+note over WALM
+  **Recovery Guarantees:**
+  - All committed transactions replayed
+  - Uncommitted transactions lost (as expected)
+  - WAL files deleted after successful replay
+  - Database in consistent state
+end note
+
+@enduml

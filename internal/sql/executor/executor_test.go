@@ -12,7 +12,7 @@ import (
 
 func TestExecutorTxnLifecycle(t *testing.T) {
 	ctx := context.Background()
-	mgr := txn.NewManager()
+	mgr := txn.NewManager(nil, nil)
 	session := &SessionTxn{}
 
 	beginPlan := planner.Plan{Root: &planner.TxnOp{Action: planner.TxnBegin}}
@@ -36,7 +36,7 @@ func TestExecutorTxnLifecycle(t *testing.T) {
 
 func TestExecutorTxnErrors(t *testing.T) {
 	ctx := context.Background()
-	mgr := txn.NewManager()
+	mgr := txn.NewManager(nil, nil)
 	session := &SessionTxn{}
 
 	// Commit without begin

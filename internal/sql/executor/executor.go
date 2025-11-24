@@ -862,80 +862,82 @@ func (e *Executor) nextIndexScan(ctx context.Context, op *planner.IndexScanOp) (
 		return false, nil
 	}
 
-	// Iterate over index
-	if !e.dataIter.Next() {
-		err := e.dataIter.Err()
-		e.closeIter()
-		if err != nil {
-			return false, err
+	// Use loop instead of recursion to prevent stack overflow on long scans
+	for {
+		// Iterate over index
+		if !e.dataIter.Next() {
+			err := e.dataIter.Err()
+			e.closeIter()
+			if err != nil {
+				return false, err
+			}
+			return false, nil
 		}
-		return false, nil
-	}
 
-	// Index Key (columns) -> Index Value (Row Key)
-	rowKey := e.dataIter.Value()
+		// Index Key (columns) -> Index Value (Row Key)
+		rowKey := e.dataIter.Value()
 
-	// Fetch actual row from table heap
-	// We need the table engine for this.
-	// Optimization: Cache table engine in Executor? For now, resolve it.
-	tableEng, err := e.provider.Engine(op.Schema, op.Table)
-	if err != nil {
-		return false, fmt.Errorf("executor: resolve table engine: %w", err)
-	}
-
-	rowData, err := tableEng.Get(ctx, rowKey)
-	if err != nil {
-		return false, fmt.Errorf("executor: fetch row from heap: %w", err)
-	}
-
-	// We have the row data, now project it.
-	// Note: We are reusing the same projection logic as SeqScan, but we need to
-	// ensure rowSpecs are set up.
-	// Wait, SeqScan sets up rowSpecs. IndexScan needs to do the same.
-
-	// Also check Filter. IndexScan might only filter on the indexed column,
-	// but if there are other conditions, we still need to check them.
-	// The current IndexScanOp has a Filter field.
-	if op.Filter != "" && !e.matchesFilter(op.Schema, op.Table, rowKey, rowData, op.Filter) {
-		// Filter didn't match (e.g. secondary condition).
-		// Recursively call nextIndexScan to get next valid row.
-		// Warning: Recursion depth. Better to loop here.
-		return e.nextIndexScan(ctx, op)
-	}
-
-	// Decode row if needed
-	var decodedValues [][]byte
-	if e.tableDef != nil {
-		var err error
-		decodedValues, err = decodeRow(rowData, len(e.tableDef.Columns))
+		// Fetch actual row from table heap
+		// We need the table engine for this.
+		// Optimization: Cache table engine in Executor? For now, resolve it.
+		tableEng, err := e.provider.Engine(op.Schema, op.Table)
 		if err != nil {
-			return false, fmt.Errorf("executor: decode row: %w", err)
+			return false, fmt.Errorf("executor: resolve table engine: %w", err)
 		}
-	}
 
-	key := append([]byte(nil), rowKey...)
-	val := append([]byte(nil), rowData...)
-	values := make([][]byte, len(e.rowSpecs))
-	cols := make([]string, len(e.rowSpecs))
-	for i, spec := range e.rowSpecs {
-		cols[i] = spec.name
-		switch spec.kind {
-		case columnKey:
-			values[i] = key
-		case columnValue:
-			if spec.index >= 0 && decodedValues != nil {
-				if spec.index < len(decodedValues) {
-					values[i] = decodedValues[spec.index]
-				} else {
-					values[i] = nil
-				}
-			} else {
-				values[i] = val
+		rowData, err := tableEng.Get(ctx, rowKey)
+		if err != nil {
+			return false, fmt.Errorf("executor: fetch row from heap: %w", err)
+		}
+
+		// We have the row data, now project it.
+		// Note: We are reusing the same projection logic as SeqScan, but we need to
+		// ensure rowSpecs are set up.
+		// Wait, SeqScan sets up rowSpecs. IndexScan needs to do the same.
+
+		// Also check Filter. IndexScan might only filter on the indexed column,
+		// but if there are other conditions, we still need to check them.
+		// The current IndexScanOp has a Filter field.
+		if op.Filter != "" && !e.matchesFilter(op.Schema, op.Table, rowKey, rowData, op.Filter) {
+			// Filter didn't match (e.g. secondary condition).
+			// Loop back to next row instead of recursion (prevents stack overflow)
+			continue
+		}
+
+		// Decode row if needed
+		var decodedValues [][]byte
+		if e.tableDef != nil {
+			var err error
+			decodedValues, err = decodeRow(rowData, len(e.tableDef.Columns))
+			if err != nil {
+				return false, fmt.Errorf("executor: decode row: %w", err)
 			}
 		}
+
+		key := append([]byte(nil), rowKey...)
+		val := append([]byte(nil), rowData...)
+		values := make([][]byte, len(e.rowSpecs))
+		cols := make([]string, len(e.rowSpecs))
+		for i, spec := range e.rowSpecs {
+			cols[i] = spec.name
+			switch spec.kind {
+			case columnKey:
+				values[i] = key
+			case columnValue:
+				if spec.index >= 0 && decodedValues != nil {
+					if spec.index < len(decodedValues) {
+						values[i] = decodedValues[spec.index]
+					} else {
+						values[i] = nil
+					}
+				} else {
+					values[i] = val
+				}
+			}
+		}
+		e.current = Row{Columns: cols, Values: values}
+		return true, nil
 	}
-	e.current = Row{Columns: cols, Values: values}
-	return true, nil
 }
 
 func (e *Executor) initIndexScan(ctx context.Context, op *planner.IndexScanOp) error {

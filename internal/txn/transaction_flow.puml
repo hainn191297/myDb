@@ -1,0 +1,178 @@
+@startuml transaction_flow
+title Transaction and Locking Flow
+
+skinparam {
+    shadowing false
+    ArrowColor #555
+    ParticipantFontSize 12
+}
+
+actor "Client 1" as C1
+actor "Client 2" as C2
+participant "Session Mgr" as SessionMgr
+participant "Txn Manager" as TxnMgr
+participant "Lock Manager" as LockMgr
+participant "Executor" as Exec
+database "Data" as Data
+
+note right of TxnMgr
+  **Transaction Manager**
+  (internal/txn/manager.go)
+  
+  - Generate transaction IDs
+  - Track txn state (Active/Committed/Aborted)
+  - BEGIN/COMMIT/ROLLBACK
+  - Release locks on commit/rollback
+end note
+
+note right of LockMgr
+  **Lock Manager**
+  (internal/txn/manager.go)
+  
+  - Row-level read/write locks
+  - Lock key format: "table.rowKey"
+  - Shared read locks (multiple readers)
+  - Exclusive write locks (one writer)
+  - Timeout-based deadlock detection (5s)
+  - Wait queue per lock
+end note
+
+== Transaction Lifecycle ==
+
+C1 -> SessionMgr: BEGIN
+SessionMgr -> TxnMgr: Begin()
+TxnMgr -> TxnMgr: Generate ID (atomic counter)
+TxnMgr -> TxnMgr: Store State{ID: 1, Status: Active}
+TxnMgr --> SessionMgr: TxnState{ID: 1}
+SessionMgr -> SessionMgr: sessionTxn.Current = txn
+SessionMgr --> C1: Transaction started
+
+C1 -> Exec: UPDATE users SET balance = 100 WHERE id = 1
+Exec -> TxnMgr: AcquireLock(txnID=1, table="users", key="1", WriteLock)
+
+TxnMgr -> LockMgr: Acquire(txnID=1, key="users.1", WriteLock)
+LockMgr -> LockMgr: Get or create lock for "users.1"
+
+alt Lock available
+    LockMgr -> LockMgr: holders[1] = WriteLock
+    LockMgr --> TxnMgr: acquired
+    TxnMgr --> Exec: ok
+    
+    Exec -> Data: Update row
+    Data --> Exec: ok
+    Exec --> C1: 1 row affected
+else Lock held by another txn
+    LockMgr -> LockMgr: Add to waiters queue
+    note right: Block until timeout or granted
+end
+
+C1 -> SessionMgr: COMMIT
+SessionMgr -> TxnMgr: Commit(txnID=1)
+TxnMgr -> TxnMgr: Update state: Committed
+TxnMgr -> LockMgr: Release(txnID=1)
+
+LockMgr -> LockMgr: Remove all locks for txn 1
+LockMgr -> LockMgr: Wake up waiters
+
+loop For each waiter
+    alt Can acquire now
+        LockMgr -> LockMgr: Grant lock
+        LockMgr -> LockMgr: Signal via channel
+    end
+end
+
+TxnMgr --> SessionMgr: committed
+SessionMgr --> C1: Transaction committed
+
+== Concurrent Transaction Isolation ==
+
+C1 -> TxnMgr: BEGIN (txn 1)
+C2 -> TxnMgr: BEGIN (txn 2)
+
+C1 -> Exec: UPDATE accounts SET balance = 100 WHERE id = 1
+Exec -> LockMgr: Acquire(txn=1, key="accounts.1", WriteLock)
+LockMgr -> LockMgr: Grant write lock to txn 1
+Exec -> Data: Update account 1
+Exec --> C1: ok
+
+par Concurrent access attempt
+    C2 -> Exec: SELECT * FROM accounts WHERE id = 1
+    Exec -> LockMgr: Acquire(txn=2, key="accounts.1", ReadLock)
+    
+    LockMgr -> LockMgr: Check compatibility
+    note right: WriteLock held by txn 1\\nReadLock requested by txn 2\\n→ CONFLICT!
+    
+    LockMgr -> LockMgr: Add txn 2 to waiters
+    LockMgr -> LockMgr: Block with timeout (5s)
+    
+    note over C2: **Waiting for txn 1 to release lock...**
+end
+
+C1 -> TxnMgr: COMMIT
+TxnMgr -> LockMgr: Release(txn=1)
+LockMgr -> LockMgr: Delete holders[1]
+LockMgr -> LockMgr: Check waiters for txn 2
+
+alt Can grant read lock now
+    LockMgr -> LockMgr: holders[2] = ReadLock
+    LockMgr -> LockMgr: Signal waiter (close channel)
+    LockMgr --> Exec: Lock acquired for txn 2
+    
+    Exec -> Data: Read account 1
+    Data --> Exec: {id: 1, balance: 100}
+    Exec --> C2: Row returned (sees committed value)
+end
+
+C2 -> TxnMgr: COMMIT
+TxnMgr -> LockMgr: Release(txn=2)
+
+== Deadlock Detection (Timeout) ==
+
+C1 -> TxnMgr: BEGIN (txn 3)
+C2 -> TxnMgr: BEGIN (txn 4)
+
+C1 -> LockMgr: Acquire(txn=3, key="accounts.1", WriteLock)
+LockMgr --> C1: granted
+
+C2 -> LockMgr: Acquire(txn=4, key="accounts.2", WriteLock)
+LockMgr --> C2: granted
+
+par Cross-lock scenario
+    C1 -> LockMgr: Acquire(txn=3, key="accounts.2", WriteLock)
+    note right: Held by txn 4
+    LockMgr -> LockMgr: Add to waiters
+    
+    C2 -> LockMgr: Acquire(txn=4, key="accounts.1", WriteLock)
+    note right: Held by txn 3
+    LockMgr -> LockMgr: Add to waiters
+end
+
+note over C1, C2: **Deadlock! Both waiting for each other**
+
+LockMgr -> LockMgr: Timeout after 5 seconds
+LockMgr --> C1: ERROR: Lock timeout
+
+C1 -> TxnMgr: ROLLBACK (forced)
+TxnMgr -> LockMgr: Release(txn=3)
+LockMgr -> LockMgr: Wake up txn 4
+
+LockMgr --> C2: Lock acquired
+C2 -> C2: Continue execution
+
+== Lock Compatibility Matrix ==
+
+note over LockMgr
+  **Compatibility:**
+  
+  |         | No Lock | Read Lock | Write Lock |
+  |---------|---------|-----------|------------|
+  | Read    | ✓       | ✓         | ✗          |
+  | Write   | ✓       | ✗         | ✗          |
+  
+  - Multiple readers can coexist
+  - Writers are exclusive
+  - Deadlock detected via timeout (5s)
+  - Lock key format: "tableName.rowKey"
+end note
+
+@enduml

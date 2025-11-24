@@ -1,0 +1,177 @@
+@startuml mydb_architecture
+!theme plain
+
+title MyDB Architecture - Current Implementation
+
+skinparam componentStyle rectangle
+skinparam rectangle {
+  FontColor #333333
+  BorderColor #999999
+  BackgroundColor #FAFAFA
+  RoundCorner 10
+}
+skinparam noteBackgroundColor #FFFDE7
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+
+'──────────────────────────────
+' CLIENT LAYER
+'──────────────────────────────
+rectangle "Client Layer" as clients {
+  component "mydb-cli\\n(Interactive REPL)" as cli
+  component "gRPC Client\\n(Custom Applications)" as grpc_client
+}
+
+'──────────────────────────────
+' SERVER LAYER
+'──────────────────────────────
+rectangle "MyDB Server (mydbd)" as server {
+  
+  rectangle "gRPC API" as grpc_api {
+    component "ExecuteSQL\\nGetMetadata" as rpc
+  }
+  
+  rectangle "Session Management" as session {
+    component "Session Manager\\n(Session ID, State)" as sessions
+    component "Transaction Context\\n(Current Txn)" as txn_context
+  }
+  
+  rectangle "SQL Processing" as sql {
+    component "Parser\\n(Recursive AST, Expr)" as parser
+    component "Planner\\n(IndexScan, SeqScan, Ops)" as planner
+    component "Executor\\n(Volcano Iterator Model)" as executor
+  }
+  
+  rectangle "Transaction System" as txn_sys {
+    component "Transaction Manager\\n(BEGIN/COMMIT/ROLLBACK)" as txnmgr
+    component "Lock Manager\\n(Row-Level Read/Write Locks)" as lockmgr
+  }
+  
+  rectangle "Schema Catalog" as catalog {
+    component "In-Memory Catalog\\n(Tables, Indexes, Types)" as cat
+    component "System Tables\\n(__catalog_tables, __catalog_indexes)" as syscat
+  }
+}
+
+'──────────────────────────────
+' STORAGE LAYER
+'──────────────────────────────
+rectangle "Storage Layer" as storage {
+  
+  rectangle "Storage Provider" as provider {
+    component "Engine Provider\\n(Heap, BTree)" as eng_provider
+    component "Index Provider\\n(BTree Indexes)" as idx_provider
+  }
+  
+  rectangle "Storage Engines" as engines {
+    component "Heap Engine\\n(Unordered Row Storage)" as heap
+    component "B+Tree Engine\\n(On-Disk Index)" as btree
+    component "Mem BTree\\n(In-Memory Testing)" as mem
+  }
+  
+  rectangle "Buffer Pool Layer" as buffer_layer {
+    component "Buffer Manager\\n(Per-Table Interface)" as buffer_mgr
+    component "Global Buffer Pool\\n(LRU Eviction, Pin/Unpin)" as global_pool
+    component "Page Cache\\n(FileID+PageID → Frame)" as page_cache
+  }
+  
+  rectangle "Page Management" as page_mgmt {
+    component "Table Manager\\n(FileID Mapping)" as table_mgr
+    component "File Manager\\n(Page R/W, Allocate)" as file_mgr
+    component "Page Abstraction\\n(4KB Pages)" as pages
+  }
+  
+  rectangle "Write-Ahead Log" as wal {
+    component "WAL Manager\\n(Per-Table Loggers)" as wal_mgr
+    component "WAL Logger\\n(Append, Sync, Recover)" as logger
+  }
+}
+
+'──────────────────────────────
+' DISK LAYER
+'──────────────────────────────
+database "File System" as fs {
+  folder "data/" {
+    file "public/users.db" as user_db
+    file "public/users__pk_users_id.db" as user_idx
+    file "__system/__catalog_tables.db" as cat_db
+  }
+  folder "WAL/" {
+    file "public/users.wal" as user_wal
+    file "__system/__catalog_tables.wal" as cat_wal
+  }
+}
+
+'──────────────────────────────
+' CONNECTIONS
+'──────────────────────────────
+cli --> rpc
+grpc_client --> rpc
+
+rpc --> sessions
+sessions --> parser
+parser --> planner
+planner --> executor
+
+executor --> txnmgr
+executor --> lockmgr
+executor --> cat
+executor --> eng_provider
+
+txnmgr ..> lockmgr : uses
+
+cat --> syscat
+syscat --> heap : persist
+
+executor --> heap : DML
+executor --> btree : index ops
+
+heap --> buffer_mgr
+btree --> buffer_mgr
+
+buffer_mgr --> table_mgr
+buffer_mgr --> global_pool
+
+global_pool --> page_cache
+global_pool --> wal_mgr : flush → WAL
+global_pool --> file_mgr : write pages
+
+table_mgr --> file_mgr
+
+file_mgr --> user_db
+file_mgr --> user_idx
+file_mgr --> cat_db
+
+wal_mgr --> logger
+logger --> user_wal
+logger --> cat_wal
+
+'──────────────────────────────
+' NOTES
+'──────────────────────────────
+note top of server
+**MyDB Server Components:**
+- gRPC API for client communication
+- Session management with transaction context
+- SQL Parser → Planner → Executor pipeline
+- Row-level locking with deadlock detection
+end note
+
+note right of storage
+**Storage Architecture:**
+- Heap files for unordered row storage
+- B+Tree for indexes (primary key + secondary)
+- Global LRU buffer pool shared across tables
+- Write-Ahead Logging for crash recovery
+- Pluggable engine design
+end note
+
+note bottom of fs
+**Durability Guarantees:**
+1. WAL append before page write
+2. WAL sync on transaction commit
+3. Buffer pool flushes dirty pages
+4. Recovery replays WAL on startup
+end note
+
+@enduml

@@ -10,6 +10,7 @@ import (
 	"github.com/hainn191297/myDb/internal/storage/engine"
 	"github.com/hainn191297/myDb/internal/storage/engine/btree"
 	"github.com/hainn191297/myDb/internal/storage/engine/heap"
+	"github.com/hainn191297/myDb/internal/storage/wal"
 )
 
 // Provider wires together table/index engines with shared buffer/table managers.
@@ -18,10 +19,14 @@ import (
 type Provider struct {
 	tm *engine.TableManager
 	bm *engine.BufferManager
+	wm *wal.Manager
 
 	mu           sync.Mutex
 	tableEngines map[string]engine.Engine
 	indexEngines map[string]engine.IndexEngine
+
+	// Catalog for accessing table schema (can be nil initially)
+	catalog *schema.Catalog
 }
 
 // New creates a storage provider backed by heap tables and an in-memory B+Tree
@@ -34,13 +39,20 @@ func New(basePath string, poolPages int) (*Provider, error) {
 		poolPages = 16
 	}
 
+	walMgr := wal.NewManager(basePath)
+	if err := walMgr.Recover(); err != nil {
+		return nil, fmt.Errorf("provider: wal recovery: %w", err)
+	}
+
 	tm := engine.NewTableManager(basePath)
-	pool := buffer.NewGlobalPool(poolPages, nil) // WAL logger wired later
-	bm := engine.NewBufferManager(tm, pool, nil)
+	dispatcher := newWalDispatcher(tm, walMgr)
+	pool := buffer.NewGlobalPool(poolPages, dispatcher)
+	bm := engine.NewBufferManager(tm, pool, dispatcher)
 
 	return &Provider{
 		tm:           tm,
 		bm:           bm,
+		wm:           walMgr,
 		tableEngines: make(map[string]engine.Engine),
 		indexEngines: make(map[string]engine.IndexEngine),
 	}, nil
@@ -60,7 +72,16 @@ func (p *Provider) Engine(schemaName, table string) (engine.Engine, error) {
 		return eng, nil
 	}
 
-	eng := heap.NewHeapEngine(schemaName, table, p.tm, p.bm)
+	// Try to get TableDef from catalog (may be nil if catalog not set yet)
+	var tableDef *schema.TableDef
+	if p.catalog != nil {
+		if td, err := p.catalog.GetTable(schemaName, table); err == nil {
+			tableDef = td
+		}
+		// If error, just pass nil and fall back to O(n) scans
+	}
+
+	eng := heap.NewHeapEngine(schemaName, table, p.tm, p.bm, tableDef, p)
 	p.tableEngines[key] = eng
 	return eng, nil
 }
@@ -80,7 +101,8 @@ func (p *Provider) Index(schemaName, table, indexName string) (engine.IndexEngin
 		return idx, nil
 	}
 
-	idx := btree.NewMemEngine()
+	idxTableName := fmt.Sprintf("%s__idx_%s", table, indexName)
+	idx := btree.New(schemaName, idxTableName, p.tm, p.bm)
 	p.indexEngines[key] = idx
 	return idx, nil
 }
@@ -106,5 +128,21 @@ func (p *Provider) LoadCatalog(ctx context.Context) (*schema.Catalog, error) {
 
 // Close releases file handles via the TableManager.
 func (p *Provider) Close() error {
+	if err := p.bm.FlushAll(); err != nil {
+		return err
+	}
+	if err := p.wm.Close(); err != nil {
+		return err
+	}
 	return p.tm.Close()
+}
+
+// FlushAll flushes dirty pages across all tables (implements txn.BufferFlusher).
+func (p *Provider) FlushAll() error {
+	return p.bm.FlushAll()
+}
+
+// SyncAll syncs all WAL loggers (implements txn.WALSyncer).
+func (p *Provider) SyncAll() error {
+	return p.wm.SyncAll()
 }

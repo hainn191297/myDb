@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/hainn191297/myDb/internal/storage/page"
@@ -23,6 +24,7 @@ type TableManager struct {
 	nextFID  uint32 // next FileID
 	byName   map[string]*page.FileManager
 	byFileID map[uint32]*page.FileManager
+	names    map[uint32]string // fid -> "schema.table"
 }
 
 func NewTableManager(basePath string) *TableManager {
@@ -31,6 +33,7 @@ func NewTableManager(basePath string) *TableManager {
 		nextFID:  1,
 		byName:   make(map[string]*page.FileManager),
 		byFileID: make(map[uint32]*page.FileManager),
+		names:    make(map[uint32]string),
 	}
 }
 
@@ -90,6 +93,7 @@ func (tm *TableManager) OpenTable(schema, table string) (uint32, *page.FileManag
 	// cache
 	tm.byName[key] = fm
 	tm.byFileID[fid] = fm
+	tm.names[fid] = key
 
 	return fid, fm, nil
 }
@@ -100,6 +104,22 @@ func (tm *TableManager) LookupByFileID(fid uint32) (*page.FileManager, bool) {
 	defer tm.mu.Unlock()
 	fm, ok := tm.byFileID[fid]
 	return fm, ok
+}
+
+// LookupName returns (schema, table) for a given FileID.
+func (tm *TableManager) LookupName(fid uint32) (string, string, bool) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	key, ok := tm.names[fid]
+	if !ok {
+		return "", "", false
+	}
+	parts := strings.SplitN(key, ".", 2)
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
 }
 
 // Close closes every FileManager
@@ -113,6 +133,7 @@ func (tm *TableManager) Close() error {
 			lastErr = err
 		}
 		delete(tm.byFileID, fid)
+		delete(tm.names, fid)
 	}
 
 	for key := range tm.byName {

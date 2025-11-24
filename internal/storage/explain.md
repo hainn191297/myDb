@@ -36,7 +36,7 @@ The PlantUML sequence in `buffer_flow.puml` captures how the storage engine's bu
 
 ## Background Flush Phase
 
- - Periodic or threshold-based processes (or explicit `FlushTable`) walk all frames, append each dirty page to the WAL, sync the WAL, then flush data pages via the FileManager so future evictions do not stall on writes while preserving WAL-before-data ordering.
+- Periodic or threshold-based processes (or explicit `FlushTable`) walk all frames, append each dirty page to the WAL, sync the WAL, then flush data pages via the FileManager so future evictions do not stall on writes while preserving WAL-before-data ordering.
 
 This flow ensures the buffer manager balances fast access (cache hits) with correctness (pin counts, dirty tracking) and durability (flushes through the page manager) while keeping internal responsibilities explicit.
 

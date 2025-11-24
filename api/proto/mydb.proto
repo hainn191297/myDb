@@ -1,0 +1,86 @@
+syntax = "proto3";
+
+package mydb.v1;
+
+option go_package = "github.com/hainn191297/myDb/api/proto/v1;protov1";
+
+// MyDBService provides SQL execution and metadata operations
+service MyDBService {
+  // ExecuteSQL executes a SQL statement and returns results
+  rpc ExecuteSQL(ExecuteSQLRequest) returns (ExecuteSQLResponse);
+  
+  // GetMetadata retrieves database schema information
+  rpc GetMetadata(GetMetadataRequest) returns (GetMetadataResponse);
+}
+
+// ExecuteSQLRequest contains a SQL statement to execute
+message ExecuteSQLRequest {
+  string sql = 1;
+  string session_id = 2; // For transaction context (future use)
+}
+
+// ExecuteSQLResponse contains the result of SQL execution
+message ExecuteSQLResponse {
+  oneof result {
+    QueryResult query_result = 1;       // For SELECT queries
+    CommandResult command_result = 2;   // For DDL/DML commands
+    ErrorResult error = 3;              // For errors
+  }
+  string session_id = 4;                // Session ID for context
+}
+
+// QueryResult contains rows returned by a SELECT query
+message QueryResult {
+  repeated string columns = 1;
+  repeated Row rows = 2;
+}
+
+// Row represents a single row of query results
+message Row {
+  repeated bytes values = 1; // Encoded column values
+}
+
+// CommandResult indicates success of a DDL/DML command
+message CommandResult {
+  string message = 1;        // Human-readable message (e.g., "1 row inserted")
+  int64 rows_affected = 2;   // Number of rows affected
+}
+
+// ErrorResult contains error information
+message ErrorResult {
+  string message = 1;        // Error message
+  string code = 2;           // Error code (e.g., "PARSE_ERROR", "CONSTRAINT_VIOLATION")
+}
+
+// GetMetadataRequest requests schema information
+message GetMetadataRequest {
+  string schema = 1;         // Schema name (empty for all schemas)
+}
+
+// GetMetadataResponse contains schema metadata
+message GetMetadataResponse {
+  repeated TableInfo tables = 1;
+}
+
+// TableInfo describes a database table
+message TableInfo {
+  string schema = 1;
+  string name = 2;
+  repeated ColumnInfo columns = 3;
+  repeated IndexInfo indexes = 4;
+}
+
+// ColumnInfo describes a table column
+message ColumnInfo {
+  string name = 1;
+  string type = 2;
+  bool nullable = 3;
+  bool primary_key = 4;
+}
+
+// IndexInfo describes a table index
+message IndexInfo {
+  string name = 1;
+  repeated string columns = 2;
+  bool unique = 3;
+}

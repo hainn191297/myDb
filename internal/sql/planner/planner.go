@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/hainn191297/myDb/internal/schema"
+	"github.com/hainn191297/myDb/internal/sql/expr"
 	"github.com/hainn191297/myDb/internal/sql/parser"
 )
 
@@ -20,10 +21,11 @@ type Operator interface {
 
 // SeqScanOp is a placeholder physical operator for table scans.
 type SeqScanOp struct {
-	Schema  string
-	Table   string
-	Columns []string
-	Filter  string
+	Schema     string
+	Table      string
+	Columns    []string
+	Filter     string    // Deprecated
+	FilterExpr expr.Expr // Structured filter
 }
 
 func (s *SeqScanOp) Name() string { return "SeqScan" }
@@ -77,15 +79,17 @@ type UpdateOp struct {
 	Table      string
 	SetClauses map[string][]byte // column -> encoded value
 	Filter     string            // WHERE clause (string for MVP)
+	FilterExpr expr.Expr         // Structured filter
 }
 
 func (u *UpdateOp) Name() string { return "Update" }
 
 // DeleteOp represents DELETE execution.
 type DeleteOp struct {
-	Schema string
-	Table  string
-	Filter string // WHERE clause
+	Schema     string
+	Table      string
+	Filter     string    // WHERE clause
+	FilterExpr expr.Expr // Structured filter
 }
 
 func (de *DeleteOp) Name() string { return "Delete" }
@@ -112,13 +116,14 @@ func (d *DropIndexOp) Name() string { return "DropIndex" }
 
 // IndexScanOp represents an index-based table scan.
 type IndexScanOp struct {
-	Schema    string
-	Table     string
-	IndexName string
-	Columns   []string
-	Filter    string
-	StartKey  []byte // For range scans (future)
-	EndKey    []byte // For range scans (future)
+	Schema     string
+	Table      string
+	IndexName  string
+	Columns    []string
+	Filter     string
+	FilterExpr expr.Expr
+	StartKey   []byte // For range scans (future)
+	EndKey     []byte // For range scans (future)
 }
 
 func (i *IndexScanOp) Name() string { return "IndexScan" }
@@ -159,9 +164,17 @@ func buildSelect(ast parser.AST, catalog *schema.Catalog) (Plan, error) {
 		return Plan{}, fmt.Errorf("planner: select missing table")
 	}
 
-	// Basic heuristic: if catalog is available and we have a WHERE clause,
-	// check if we can use an index.
-	if catalog != nil && ast.Where != "" {
+	// Check if we can use an index using the structured expression
+	if catalog != nil && ast.WhereExpr != nil {
+		if indexScan := tryIndexScan(ast.WhereExpr, catalog, ast.SchemaName, ast.TableName); indexScan != nil {
+			// Copy filter string for backward compatibility/logging
+			indexScan.Filter = ast.Where
+			return Plan{Root: indexScan}, nil
+		}
+	}
+
+	// Fallback to string-based check if WhereExpr is nil but Where string exists (backward compat)
+	if catalog != nil && ast.Where != "" && ast.WhereExpr == nil {
 		// Simple check for "col = val"
 		// We split by "=" and check if the left side is an indexed column.
 		parts := strings.Split(ast.Where, "=")
@@ -186,12 +199,43 @@ func buildSelect(ast parser.AST, catalog *schema.Catalog) (Plan, error) {
 	}
 
 	op := &SeqScanOp{
-		Schema:  ast.SchemaName,
-		Table:   ast.TableName,
-		Columns: ast.Columns,
-		Filter:  ast.Where,
+		Schema:     ast.SchemaName,
+		Table:      ast.TableName,
+		Columns:    ast.Columns,
+		Filter:     ast.Where,
+		FilterExpr: ast.WhereExpr,
 	}
 	return Plan{Root: op}, nil
+}
+
+// tryIndexScan attempts to create an IndexScanOp from a WHERE expression.
+// Currently supports simple equality checks: "col = val"
+func tryIndexScan(whereExpr expr.Expr, catalog *schema.Catalog, schemaName, tableName string) *IndexScanOp {
+	// Look for simple BinaryExpr with OpEquals
+	if binExpr, ok := whereExpr.(*expr.BinaryExpr); ok {
+		if binExpr.Op == expr.OpEquals {
+			// Check if left side is a column reference
+			if colRef, ok := binExpr.Left.(*expr.ColumnRefExpr); ok {
+				colName := colRef.Name
+
+				// Check if index exists for this column
+				idx, err := catalog.FindIndexForColumn(schemaName, tableName, colName)
+				if err == nil && idx != nil {
+					// Found an index!
+					// TODO: We should also extract the value from binExpr.Right to set StartKey/EndKey
+					// For now, we just identify the index scan opportunity.
+					return &IndexScanOp{
+						Schema:     schemaName,
+						Table:      tableName,
+						IndexName:  idx.IndexName,
+						Columns:    []string{"*"}, // Placeholder, will be refined
+						FilterExpr: whereExpr,
+					}
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func buildCreateTable(ast parser.AST) (Plan, error) {
@@ -392,6 +436,7 @@ func buildUpdate(ast parser.AST, catalog *schema.Catalog) (Plan, error) {
 		Table:      spec.Table,
 		SetClauses: encodedSetClauses,
 		Filter:     spec.Where,
+		FilterExpr: ast.WhereExpr,
 	}
 	return Plan{Root: op}, nil
 }
@@ -413,9 +458,10 @@ func buildDelete(ast parser.AST, catalog *schema.Catalog) (Plan, error) {
 	}
 
 	op := &DeleteOp{
-		Schema: spec.Schema,
-		Table:  spec.Table,
-		Filter: spec.Where,
+		Schema:     spec.Schema,
+		Table:      spec.Table,
+		Filter:     spec.Where,
+		FilterExpr: ast.WhereExpr,
 	}
 	return Plan{Root: op}, nil
 }

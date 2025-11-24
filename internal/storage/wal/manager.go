@@ -83,6 +83,23 @@ func (m *Manager) Close() error {
 	return nil
 }
 
+// SyncAll flushes every open WAL logger.
+func (m *Manager) SyncAll() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var errs []error
+	for key, logger := range m.logs {
+		if err := logger.Sync(); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", key, err))
+		}
+	}
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	return nil
+}
+
 // Recover scans all WAL files under basePath and replays them into their data files.
 // After successful replay, the WAL file is removed to avoid double application.
 func (m *Manager) Recover() error {

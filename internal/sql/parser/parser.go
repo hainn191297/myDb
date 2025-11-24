@@ -1,9 +1,11 @@
 package parser
 
 import (
-	"errors"
 	"fmt"
 	"strings"
+
+	dberrors "github.com/hainn191297/myDb/internal/errors"
+	"github.com/hainn191297/myDb/internal/sql/expr"
 )
 
 // AST represents the root of a parsed SQL statement.
@@ -12,7 +14,10 @@ type AST struct {
 	SchemaName string
 	TableName  string
 	Columns    []string
-	Where      string
+
+	// WHERE clause (dual support for migration)
+	Where     string    // Deprecated: use WhereExpr instead
+	WhereExpr expr.Expr // Structured WHERE clause (nil if empty)
 
 	// DDL-specific fields
 	CreateTable *CreateTableSpec
@@ -108,6 +113,8 @@ const (
 // can build upon while more sophisticated parsing is implemented later.
 func Parse(sql string) (AST, error) {
 	trimmed := strings.TrimSpace(sql)
+	trimmed = strings.TrimSuffix(trimmed, ";")
+	trimmed = strings.TrimSpace(trimmed)
 	if trimmed == "" {
 		return AST{}, ErrEmptyStatement
 	}
@@ -183,13 +190,24 @@ func parseSelect(sql string) (AST, error) {
 		return AST{}, fmt.Errorf("parser: invalid column list")
 	}
 
-	return AST{
+	ast := AST{
 		Type:       SelectStmt,
 		SchemaName: schema,
 		TableName:  table,
 		Columns:    cols,
-		Where:      wherePart,
-	}, nil
+		Where:      wherePart, // Keep for backward compat
+	}
+
+	// Parse WHERE clause into structured expression
+	if wherePart != "" {
+		whereExpr, err := expr.ParseExpr(wherePart)
+		if err != nil {
+			return AST{}, fmt.Errorf("parser: invalid WHERE clause: %w", err)
+		}
+		ast.WhereExpr = whereExpr
+	}
+
+	return ast, nil
 }
 
 func splitColumns(part string) []string {
@@ -545,10 +563,10 @@ func parseUpdate(sql string) (AST, error) {
 	afterSet := strings.TrimSpace(rest[setIdx+len(" SET "):])
 
 	// Find WHERE clause
-	whereIdx := strings.Index(strings.ToUpper(afterSet), " WHERE ")
 	var setClauses map[string]string
 	var wherePart string
 
+	whereIdx := strings.Index(strings.ToUpper(afterSet), " WHERE ")
 	if whereIdx >= 0 {
 		setClausePart := strings.TrimSpace(afterSet[:whereIdx])
 		wherePart = strings.TrimSpace(afterSet[whereIdx+len(" WHERE "):])
@@ -557,14 +575,27 @@ func parseUpdate(sql string) (AST, error) {
 		setClauses = parseSetClauses(afterSet)
 	}
 
+	spec := &UpdateSpec{
+		Schema:     schema,
+		Table:      table,
+		SetClauses: setClauses,
+		Where:      wherePart, // Backward compat
+	}
+
+	// Parse WHERE clause into structured expression
+	var whereExpr expr.Expr
+	if wherePart != "" {
+		var err error
+		whereExpr, err = expr.ParseExpr(wherePart)
+		if err != nil {
+			return AST{}, fmt.Errorf("parser: invalid WHERE clause in UPDATE: %w", err)
+		}
+	}
+
 	return AST{
-		Type: UpdateStmt,
-		Update: &UpdateSpec{
-			Schema:     schema,
-			Table:      table,
-			SetClauses: setClauses,
-			Where:      wherePart,
-		},
+		Type:      UpdateStmt,
+		Update:    spec,
+		WhereExpr: whereExpr,
 	}, nil
 }
 
@@ -594,13 +625,26 @@ func parseDelete(sql string) (AST, error) {
 
 	schema, table := splitSchemaTable(tablePart)
 
+	spec := &DeleteSpec{
+		Schema: schema,
+		Table:  table,
+		Where:  wherePart, // Backward compat
+	}
+
+	// Parse WHERE clause into structured expression
+	var whereExpr expr.Expr
+	if wherePart != "" {
+		var err error
+		whereExpr, err = expr.ParseExpr(wherePart)
+		if err != nil {
+			return AST{}, fmt.Errorf("parser: invalid WHERE clause in DELETE: %w", err)
+		}
+	}
+
 	return AST{
-		Type: DeleteStmt,
-		Delete: &DeleteSpec{
-			Schema: schema,
-			Table:  table,
-			Where:  wherePart,
-		},
+		Type:      DeleteStmt,
+		Delete:    spec,
+		WhereExpr: whereExpr,
 	}, nil
 }
 
@@ -655,5 +699,7 @@ func parseSetClauses(setClauseStr string) map[string]string {
 }
 
 var (
-	ErrEmptyStatement = errors.New("parser: empty statement")
+	// ErrEmptyStatement is returned when parsing an empty SQL string.
+	// Deprecated: Use dberrors.ErrEmptyStatement instead.
+	ErrEmptyStatement = dberrors.ErrEmptyStatement
 )

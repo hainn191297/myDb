@@ -1,6 +1,8 @@
 package heap
 
 import (
+	"context"
+	"encoding/binary"
 	"fmt"
 
 	"github.com/hainn191297/myDb/internal/storage/engine"
@@ -187,4 +189,45 @@ func (t *Table) Delete(pid page.PageID, slot int) error {
 
 	t.bm.Unpin(fid, pid, true)
 	return nil
+}
+
+// GetTuple retrieves the raw tuple bytes at (pageID, slot) for index lookups.
+// Returns the complete encoded tuple data.
+func (t *Table) GetTuple(ctx context.Context, pid page.PageID, slot int) ([]byte, error) {
+	fid, _, err := t.tm.OpenTable(t.schema, t.name)
+	if err != nil {
+		return nil, fmt.Errorf("table: open: %w", err)
+	}
+
+	_, pg, err := t.bm.GetPage(t.schema, t.name, pid)
+	if err != nil {
+		return nil, fmt.Errorf("table: get page %d: %w", pid, err)
+	}
+	defer t.bm.Unpin(fid, pid, false)
+
+	hp := WrapPage(pg)
+	offset, regionData, ok := hp.GetTupleRegion(slot)
+	if !ok {
+		return nil, fmt.Errorf("table: slot %d not found or deleted", slot)
+	}
+
+	// Decode tuple length from the region
+	// Tuple format: [keyLen uint32][valLen uint32][key][value]
+	if len(regionData) < 8 {
+		return nil, fmt.Errorf("table: corrupt tuple at slot %d", slot)
+	}
+
+	keyLen := binary.LittleEndian.Uint32(regionData[0:4])
+	valLen := binary.LittleEndian.Uint32(regionData[4:8])
+	tupleLen := 8 + keyLen + valLen
+
+	if int(tupleLen) > len(regionData) {
+		return nil, fmt.Errorf("table: incomplete tuple at slot %d (expected %d bytes)", slot, tupleLen)
+	}
+
+	// Return a copy to avoid holding reference to page buffer
+	tupleData := make([]byte, tupleLen)
+	copy(tupleData, pg.Data[offset:int(offset)+int(tupleLen)])
+
+	return tupleData, nil
 }

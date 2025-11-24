@@ -1,0 +1,51 @@
+@startuml
+title Schema Catalog Flow
+
+actor Client
+participant "Catalog" as C
+participant "Provider\n(TableManager)" as P
+database "__system.__catalog_tables" as TBL
+database "__system.__catalog_indexes" as IDX
+
+== Startup ==
+Client -> P : LoadCatalog()
+P -> C : NewCatalog(tablesEng,indexEng)
+C -> TBL : scan tables
+C -> IDX : scan indexes
+Client <-- P : catalog ready (cache warm)
+
+== Create Table ==
+Client -> C : CreateTable(schema,table,columns)
+C -> C : validate (non-empty, no dup)
+C -> P : Engine(schema,table) (ensure file)
+C -> TBL : Put(tableKey, json(TableDef))
+C -> C : cache[tableKey]=def
+
+== Drop Table ==
+Client -> C : DropTable(schema,table)
+C -> TBL : Delete(tableKey)
+C -> C : evict table + indexes cache
+
+== Create Index ==
+Client -> C : CreateIndex(schema,table,indexName,cols,unique,isPK)
+C -> C : verify table exists & not dup
+C -> IDX : Put(indexKey, json(IndexDef))
+C -> C : cache indexes for table
+
+== Drop Index ==
+Client -> C : DropIndex(schema,table,indexName)
+C -> IDX : Delete(indexKey)
+C -> C : remove from index cache
+
+== Lookup ==
+Client -> C : GetTable/GetIndexes(...)
+C -> C : return from cache (no I/O)
+
+note right of C
+Catalog is the single source of truth
+for schema & index metadata:
+- caches in memory
+- persists in system tables
+end note
+
+@enduml

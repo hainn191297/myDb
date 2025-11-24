@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sync"
 
+	dberrors "github.com/hainn191297/myDb/internal/errors"
 	"github.com/hainn191297/myDb/internal/storage/engine"
 )
 
@@ -86,7 +87,7 @@ func (c *Catalog) LoadSystemTables(ctx context.Context) error {
 func (c *Catalog) loadTables(ctx context.Context) error {
 	iter, err := c.tableEngine.Scan(ctx, nil, nil)
 	if err != nil {
-		if errors.Is(err, engine.ErrKeyNotFound) {
+		if errors.Is(err, dberrors.ErrKeyNotFound) {
 			return nil
 		}
 		return fmt.Errorf("catalog: scan tables: %w", err)
@@ -107,7 +108,7 @@ func (c *Catalog) loadTables(ctx context.Context) error {
 func (c *Catalog) loadIndexes(ctx context.Context) error {
 	iter, err := c.indexEngine.Scan(ctx, nil, nil)
 	if err != nil {
-		if errors.Is(err, engine.ErrKeyNotFound) {
+		if errors.Is(err, dberrors.ErrKeyNotFound) {
 			return nil
 		}
 		return fmt.Errorf("catalog: scan indexes: %w", err)
@@ -128,10 +129,10 @@ func (c *Catalog) loadIndexes(ctx context.Context) error {
 // CreateTable creates a new table definition in the catalog.
 func (c *Catalog) CreateTable(ctx context.Context, schema, table string, columns []ColumnDef) error {
 	if schema == "" || table == "" {
-		return errors.New("catalog: schema and table names cannot be empty")
+		return dberrors.ErrEmptyTableName
 	}
 	if len(columns) == 0 {
-		return errors.New("catalog: table must have at least one column")
+		return dberrors.ErrEmptyColumnList
 	}
 
 	c.mu.Lock()
@@ -139,7 +140,7 @@ func (c *Catalog) CreateTable(ctx context.Context, schema, table string, columns
 
 	key := c.tableKey(schema, table)
 	if _, exists := c.cache[key]; exists {
-		return fmt.Errorf("catalog: table %s.%s already exists", schema, table)
+		return fmt.Errorf("%w: %s.%s", dberrors.ErrTableExists, schema, table)
 	}
 
 	tableDef := &TableDef{
@@ -172,7 +173,7 @@ func (c *Catalog) DropTable(ctx context.Context, schema, table string) error {
 
 	key := c.tableKey(schema, table)
 	if _, exists := c.cache[key]; !exists {
-		return fmt.Errorf("catalog: table %s.%s does not exist", schema, table)
+		return fmt.Errorf("%w: %s.%s", dberrors.ErrTableNotFound, schema, table)
 	}
 
 	// Delete from system table
@@ -198,7 +199,7 @@ func (c *Catalog) GetTable(schema, table string) (*TableDef, error) {
 	key := c.tableKey(schema, table)
 	tableDef, exists := c.cache[key]
 	if !exists {
-		return nil, fmt.Errorf("catalog: table %s.%s not found", schema, table)
+		return nil, fmt.Errorf("%w: %s.%s", dberrors.ErrTableNotFound, schema, table)
 	}
 
 	return tableDef, nil
@@ -223,13 +224,13 @@ func (c *Catalog) CreateIndex(ctx context.Context, schema, table, indexName stri
 
 	tableKey := c.tableKey(schema, table)
 	if _, exists := c.cache[tableKey]; !exists {
-		return fmt.Errorf("catalog: table %s.%s does not exist", schema, table)
+		return fmt.Errorf("%w: %s.%s", dberrors.ErrTableNotFound, schema, table)
 	}
 
 	// Check if index already exists
 	for _, idx := range c.indexCache[tableKey] {
 		if idx.IndexName == indexName {
-			return fmt.Errorf("catalog: index %s already exists on table %s.%s", indexName, schema, table)
+			return fmt.Errorf("%w: %s on %s.%s", dberrors.ErrIndexExists, indexName, schema, table)
 		}
 	}
 
@@ -273,7 +274,7 @@ func (c *Catalog) DropIndex(ctx context.Context, schema, table, indexName string
 	}
 
 	if idxPos == -1 {
-		return fmt.Errorf("catalog: index %s does not exist on table %s.%s", indexName, schema, table)
+		return fmt.Errorf("%w: %s on %s.%s", dberrors.ErrIndexNotFound, indexName, schema, table)
 	}
 
 	indexKey := c.indexKey(schema, table, indexName)
@@ -293,7 +294,7 @@ func (c *Catalog) GetIndexes(schema, table string) ([]IndexDef, error) {
 
 	tableKey := c.tableKey(schema, table)
 	if _, exists := c.cache[tableKey]; !exists {
-		return nil, fmt.Errorf("catalog: table %s.%s does not exist", schema, table)
+		return nil, fmt.Errorf("%w: %s.%s", dberrors.ErrTableNotFound, schema, table)
 	}
 
 	// Return a copy to prevent modification

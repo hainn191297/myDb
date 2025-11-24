@@ -1,0 +1,207 @@
+@startuml sql_processing_flow
+title SQL Query Processing Flow - Parser → Planner → Executor
+
+skinparam {
+    shadowing false
+    ArrowColor #555
+    ParticipantFontSize 12
+}
+
+actor "Client" as Client
+participant "Server" as Server
+participant "Parser" as Parser
+participant "Planner" as Planner
+participant "Executor" as Executor
+participant "Catalog" as Catalog
+participant "Provider" as Provider
+participant "Engine" as Engine
+
+note right of Parser
+  **Parser (internal/sql/parser/)**
+  - Tokenize SQL string
+  - Build recursive AST
+  - Parse expressions (BinaryExpr, ColumnRef, Literal)
+  - Support: SELECT, INSERT, UPDATE, DELETE, CREATE, etc.
+end note
+
+note right of Planner
+  **Planner (internal/sql/planner/)**
+  - Convert AST to physical operators
+  - Choose IndexScan vs SeqScan
+  - Build operator tree
+  - No cost-based optimization (yet)
+end note
+
+note right of Executor
+  **Executor (internal/sql/executor/)**
+  - Volcano iterator model (Next/Row)
+  - Evaluate expressions
+  - Acquire row-level locks
+  - Maintain indexes
+  - Return result rows
+end note
+
+== Example: SELECT * FROM users WHERE age > 25 ==
+
+Client -> Server: ExecuteSQL("SELECT * FROM users WHERE age > 25")
+
+Server -> Parser: Parse(sql)
+Parser -> Parser: Tokenize
+Parser -> Parser: Build AST\\n- StatementType: SelectStmt\\n- Table: "users"\\n- Columns: ["*"]
+Parser -> Parser: Parse WHERE clause\\n- BinaryExpr(ColumnRef("age"), ">", Literal(25))
+Parser --> Server: AST
+
+Server -> Planner: Build(ast, catalog)
+
+Planner -> Catalog: GetTable("public", "users")
+Catalog --> Planner: TableDef{Columns, Indexes}
+
+Planner -> Catalog: GetIndexes("public", "users")
+Catalog --> Planner: []IndexDef
+
+Planner -> Planner: Analyze WHERE clause\\n- Simple equality? → IndexScan\\n- Complex or no index? → SeqScan
+
+alt Has index on 'age'
+    Planner -> Planner: Create IndexScanOp\\n- IndexName: "idx_age"\\n- FilterExpr: age > 25
+else No index
+    Planner -> Planner: Create SeqScanOp\\n- Table: "users"\\n- FilterExpr: age > 25
+end
+
+Planner --> Server: Plan{Root: SeqScanOp}
+
+Server -> Executor: New(plan, options)
+Server -> Executor: Next()
+
+loop While has rows
+    Executor -> Provider: Engine("public", "users")
+    Provider --> Executor: HeapEngine
+    
+    Executor -> Engine: Scan(ctx, nil, nil)
+    Engine --> Executor: Iterator
+    
+    loop For each row
+        Executor -> Engine: iter.Next()
+        Engine --> Executor: true (key, value)
+        
+        Executor -> Executor: decodeRow(value, columns)
+        Executor -> Executor: Build rowMap{id, name, age, ...}
+        
+        Executor -> Executor: evaluateExpr(FilterExpr, rowMap)
+        note right: age > 25?
+        
+        alt Expression matches
+            Executor -> Executor: project columns\\nbuild result row
+            Executor --> Server: true (row available)
+            Server --> Client: Row{id, name, age}
+        else Doesn't match
+            Executor -> Executor: continue to next row
+        end
+    end
+    
+    Executor -> Engine: iter.Close()
+end
+
+Executor --> Server: false (no more rows)
+Server --> Client: Query complete
+
+== Example: INSERT INTO users VALUES (1, 'Alice', 30) ==
+
+Client -> Server: ExecuteSQL("INSERT INTO users VALUES (1, 'Alice', 30)")
+
+Server -> Parser: Parse(sql)
+Parser -> Parser: Build AST\\n- StatementType: InsertStmt\\n- Values: [1, 'Alice', 30]
+Parser --> Server: AST
+
+Server -> Planner: Build(ast, catalog)
+Planner -> Catalog: GetTable("public", "users")
+Catalog --> Planner: TableDef
+Planner -> Planner: Create InsertOp\\n- Table: "users"\\n- Values: encoded
+Planner --> Server: Plan{Root: InsertOp}
+
+Server -> Executor: New(plan, options)
+Server -> Executor: Next()
+
+Executor -> Catalog: GetIndexes("public", "users")
+Catalog --> Executor: [idx_pk_users_id, idx_age]
+
+loop For each unique index
+    Executor -> Provider: Index("public", "users", "idx_pk_users_id")
+    Provider --> Executor: BTreeEngine
+    
+    Executor -> Engine: Search(key=1)
+    alt Key exists
+        Engine --> Executor: found=true
+        Executor --> Server: ERROR: duplicate PK
+    else Key doesn't exist
+        Engine --> Executor: found=false
+    end
+end
+
+note right of Executor: All uniqueness checks passed
+
+Executor -> Provider: Engine("public", "users")
+Provider --> Executor: HeapEngine
+
+Executor -> Engine: Put(key=1, value=encoded[Alice,30])
+Engine --> Executor: ok
+
+loop For each index
+    Executor -> Provider: Index(indexName)
+    Provider --> Executor: BTreeEngine
+    
+    Executor -> Executor: extractIndexKey(values, idx.Columns)
+    
+    alt Primary Key + HeapEngine
+        note right: HeapEngine auto-maintains PK\\nwith value=location
+        Executor -> Executor: skip (already maintained)
+    else Other indexes
+        Executor -> Engine: Insert(indexKey, rowKey)
+        Engine --> Executor: ok
+    end
+end
+
+Executor --> Server: Insert complete (1 row affected)
+Server --> Client: CommandResult{RowsAffected: 1}
+
+== Example: UPDATE users SET age = 31 WHERE id = 1 ==
+
+Client -> Server: ExecuteSQL("UPDATE users SET age = 31 WHERE id = 1")
+
+Server -> Parser: Parse(sql)
+Parser --> Server: AST{UpdateStmt, SetClauses, Where}
+
+Server -> Planner: Build(ast, catalog)
+Planner --> Server: Plan{Root: UpdateOp}
+
+Server -> Executor: Next()
+
+Executor -> Provider: Engine("public", "users")
+Executor -> Engine: Scan(nil, nil)
+
+loop For each row
+    Executor -> Executor: decode row
+    Executor -> Executor: evaluateExpr(WHERE: id = 1)
+    
+    alt WHERE matches
+        Executor -> Executor: acquire WriteLock(table, key)
+        note right: Row-level locking
+        
+        Executor -> Executor: apply SET clauses\\nnewValues[age] = 31
+        
+        Executor -> Executor: re-encode row
+        
+        Executor -> Engine: Put(key, newRowData)
+        
+        loop For each index
+            alt Index key changed
+                Executor -> Engine: Delete(oldIndexKey)
+                Executor -> Engine: Insert(newIndexKey, rowKey)
+            end
+        end
+    end
+end
+
+Executor --> Server: Update complete
+Server --> Client: CommandResult{RowsAffected: 1}
+
+@enduml

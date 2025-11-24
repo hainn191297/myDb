@@ -2,7 +2,8 @@ package engine
 
 import (
 	"context"
-	"errors"
+
+	dberrors "github.com/hainn191297/myDb/internal/errors"
 )
 
 // Engine describes the pluggable storage interface.
@@ -34,7 +35,8 @@ type Iterator interface {
 var ErrNotImplemented = errPlaceholder("storage engine not implemented")
 
 // ErrKeyNotFound signals that the requested key does not exist.
-var ErrKeyNotFound = errors.New("storage engine: key not found")
+// Deprecated: Use dberrors.ErrKeyNotFound instead.
+var ErrKeyNotFound = dberrors.ErrKeyNotFound
 
 type errPlaceholder string
 

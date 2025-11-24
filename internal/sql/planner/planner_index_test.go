@@ -99,8 +99,9 @@ func TestPlanIndexScanSelection(t *testing.T) {
 			wantType: "IndexScan",
 		},
 		{
-			name:     "WHERE complex (no simple =)",
-			sql:      "SELECT * FROM users WHERE email LIKE 'alice%'",
+			name: "WHERE complex (no simple =)",
+			// "id > 5" is not a simple equality check, so should be SeqScan
+			sql:      "SELECT * FROM users WHERE id > 5",
 			wantType: "SeqScan",
 		},
 	}

@@ -1,0 +1,148 @@
+@startuml btree_operations
+title B+Tree Insert with Split Flow (WAL-logged)
+
+skinparam {
+    shadowing false
+    ArrowColor #555555
+    ParticipantFontSize 12
+    NoteFontSize 11
+}
+
+actor "Executor" as Exec
+participant "B+Tree Engine" as BTree
+participant "Buffer Manager" as BM
+participant "Global Pool" as GP
+participant "WAL Logger" as WAL
+participant "File Manager" as FM
+database "Index File\\n(users__pk.db)" as Disk
+database "WAL File" as WALFile
+
+note right of BTree
+  **B+Tree Structure:**
+  - Root page (PageID=1)
+  - Internal nodes (keys + children)
+  - Leaf nodes (key-value pairs)
+  - Next-leaf pointers for range scan
+end note
+
+== Insert Key-Value ==
+
+Exec -> BTree: Insert(key, value)
+BTree -> BTree: loadRoot()
+BTree -> BM: GetPage(schema, table, rootPID)
+BM -> GP: GetPage(fid, rootPID)
+alt Cache Hit
+    GP --> BM: Page (pinned)
+else Cache Miss
+    GP -> FM: ReadPage(rootPID)
+    FM -> Disk: read
+    Disk --> FM: page data
+    FM --> GP: Page
+    GP -> GP: cache + pin
+end
+BM --> BTree: Root Page
+
+BTree -> BTree: Traverse to leaf\\n(choose child per key comparison)
+
+loop Descend to leaf
+    BTree -> BM: GetPage(childPID)
+    BM -> GP: GetPage
+    GP --> BM: Child Page
+    BTree -> BM: Unpin(parentPID, dirty=false)
+end
+
+BTree -> BTree: insert entry at position
+
+alt Leaf has space
+    BTree -> BTree: writeLeaf(pg, entries, next)
+    BTree -> BM: Unpin(leafPID, dirty=true)
+    note right: dirty=true triggers WAL on flush
+else Leaf FULL - Need Split
+    BTree -> BTree: splitLeaf(fm, pg, entries)
+    
+    note over BTree
+      **Split Process:**
+      1. Allocate new PageID
+      2. Write left half to existing page
+      3. Initialize right page (empty)
+      4. Load right page via BufferManager
+      5. Write right half to right page
+    end note
+    
+    BTree -> FM: AllocatePage()
+    FM --> BTree: newPID
+    
+    BTree -> BTree: writeLeaf(pg, left_entries, newPID)
+    
+    BTree -> FM: WritePage(newPage)\\n(initialize empty)
+    FM -> Disk: write empty page
+    
+    BTree -> BM: GetPage(schema, table, newPID)
+    BM -> GP: GetPage(fid, newPID)
+    GP -> FM: ReadPage (just written)
+    FM --> GP: Page
+    GP --> BM: Right Page (pinned)
+    BM --> BTree: Right Page
+    
+    BTree -> BTree: writeLeaf(rightPg, right_entries, 0)
+    
+    BTree -> BM: Unpin(newPID, dirty=true)
+    note right: Marks right page dirty
+    
+    BTree -> BTree: propagateSplit(path, promoteKey, newPID)
+    
+    alt Parent is root leaf
+        BTree -> FM: AllocatePage()
+        FM --> BTree: newRootID
+        
+        BTree -> FM: WritePage(newRoot)\\n(initialize empty)
+        BTree -> BM: GetPage(schema, table, newRootID)
+        BM --> BTree: New Root Page
+        
+        BTree -> BTree: writeInternal(newRoot, {keys, children})
+        BTree -> BM: Unpin(newRootID, dirty=true)
+        BTree -> BTree: root = newRootID
+    else Parent has space
+        BTree -> BTree: insert promoteKey into parent
+        BTree -> BM: Unpin(parentPID, dirty=true)
+    else Parent FULL
+        BTree -> BTree: splitInternal + propagate
+        note right: Recursive split
+    end
+    
+    BTree -> BM: Unpin(leftPID, dirty=true)
+    note right: Both left and right marked dirty
+end
+
+== Flush Dirty Pages (on Unpin or explicit Flush) ==
+
+BM -> GP: Unpin(fid, pid, dirty=true)
+alt Buffer pool evicts or explicit flush
+    GP -> WAL: Append(fid, pid, pageData)
+    WAL -> WALFile: write log record
+    WAL --> GP: ok
+    
+    GP -> WAL: Sync()
+    WAL -> WALFile: fsync
+    note right: **WAL flushed!**
+    
+    GP -> FM: WritePage(page)
+    FM -> Disk: write block
+    note right: Data written after WAL
+    
+    GP -> FM: Sync()
+    FM -> Disk: fsync
+end
+
+BTree --> Exec: Insert complete
+
+note bottom of GP
+  **Durability Guarantee:**
+  1. Page modifications marked dirty
+  2. Unpin triggers flush (eventually)
+  3. WAL written BEFORE data page
+  4. fsync ensures disk durability
+  5. Crash recovery replays WAL
+end note
+
+@enduml

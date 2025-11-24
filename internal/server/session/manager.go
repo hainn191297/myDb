@@ -1,84 +1,116 @@
 package session
 
 import (
-    "context"
-    "sync"
-    "time"
+	"context"
+	"sync"
+	"time"
+
+	"github.com/hainn191297/myDb/internal/logging"
+	"github.com/hainn191297/myDb/internal/txn"
 )
 
 // Manager tracks client sessions and enforces limits defined in config.
 type Manager struct {
-    maxSessions int
-    expiry      time.Duration
+	maxSessions int
+	expiry      time.Duration
 
-    mu       sync.Mutex
-    sessions map[string]Session
+	mu       sync.Mutex
+	sessions map[string]Session
 }
 
 // Session is a lightweight record for now; it will expand with txn state later.
 type Session struct {
-    ID        string
-    CreatedAt time.Time
-    LastSeen  time.Time
+	ID        string
+	CreatedAt time.Time
+	LastSeen  time.Time
+	TxnState  *txn.State // Active transaction state (nil if none)
 }
 
 func NewManager(max int, expiry time.Duration) *Manager {
-    return &Manager{
-        maxSessions: max,
-        expiry:      expiry,
-        sessions:    make(map[string]Session),
-    }
+	return &Manager{
+		maxSessions: max,
+		expiry:      expiry,
+		sessions:    make(map[string]Session),
+	}
 }
 
 // Create registers a new session if capacity allows.
 func (m *Manager) Create(ctx context.Context) (Session, error) {
-    select {
-    case <-ctx.Done():
-        return Session{}, ctx.Err()
-    default:
-    }
+	select {
+	case <-ctx.Done():
+		logging.WarnContext(ctx, "session create canceled: %v", ctx.Err())
+		return Session{}, ctx.Err()
+	default:
+	}
 
-    m.mu.Lock()
-    defer m.mu.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-    if len(m.sessions) >= m.maxSessions {
-        return Session{}, ErrSessionLimit
-    }
+	if len(m.sessions) >= m.maxSessions {
+		logging.WarnContext(ctx, "session limit reached (%d)", m.maxSessions)
+		return Session{}, ErrSessionLimit
+	}
 
-    now := time.Now()
-    sess := Session{
-        ID:        generateID(),
-        CreatedAt: now,
-        LastSeen:  now,
-    }
-    m.sessions[sess.ID] = sess
-    return sess, nil
+	now := time.Now()
+	sess := Session{
+		ID:        generateID(),
+		CreatedAt: now,
+		LastSeen:  now,
+	}
+	m.sessions[sess.ID] = sess
+	logging.InfoContext(ctx, "session created id=%s", sess.ID)
+	return sess, nil
+}
+
+// Get retrieves a session by ID.
+func (m *Manager) Get(id string) (Session, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	sess, ok := m.sessions[id]
+	if !ok {
+		return Session{}, fmtError("session not found")
+	}
+	return sess, nil
+}
+
+// Update updates the session state.
+func (m *Manager) Update(sess Session) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, ok := m.sessions[sess.ID]; ok {
+		sess.LastSeen = time.Now()
+		m.sessions[sess.ID] = sess
+	}
 }
 
 // Touch updates LastSeen to keep-alive the session.
 func (m *Manager) Touch(id string) {
-    m.mu.Lock()
-    defer m.mu.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-    sess, ok := m.sessions[id]
-    if !ok {
-        return
-    }
-    sess.LastSeen = time.Now()
-    m.sessions[id] = sess
+	sess, ok := m.sessions[id]
+	if !ok {
+		logging.Debugf("session touch ignored: id=%s not found", id)
+		return
+	}
+	sess.LastSeen = time.Now()
+	m.sessions[id] = sess
 }
 
 // Sweep removes expired sessions; intended for a background ticker.
 func (m *Manager) Sweep() {
-    m.mu.Lock()
-    defer m.mu.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-    now := time.Now()
-    for id, sess := range m.sessions {
-        if now.Sub(sess.LastSeen) > m.expiry {
-            delete(m.sessions, id)
-        }
-    }
+	now := time.Now()
+	for id, sess := range m.sessions {
+		if now.Sub(sess.LastSeen) > m.expiry {
+			delete(m.sessions, id)
+			logging.Debugf("session expired id=%s", id)
+		}
+	}
 }
 
 var ErrSessionLimit = fmtError("session limit reached")
@@ -90,5 +122,5 @@ func (e fmtError) Error() string { return string(e) }
 
 // generateID will become cryptographically strong later.
 func generateID() string {
-    return time.Now().Format("20060102T150405.000000000")
+	return time.Now().Format("20060102T150405.000000000")
 }
