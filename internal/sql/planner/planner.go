@@ -1,9 +1,11 @@
 package planner
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
+	"github.com/hainn191297/myDb/internal/logging"
 	"github.com/hainn191297/myDb/internal/schema"
 	"github.com/hainn191297/myDb/internal/sql/expr"
 	"github.com/hainn191297/myDb/internal/sql/parser"
@@ -130,10 +132,10 @@ func (i *IndexScanOp) Name() string { return "IndexScan" }
 
 // Build transforms the parser AST into an executable plan.
 // The catalog is required for DML statements to validate schemas and encode values.
-func Build(ast parser.AST, catalog *schema.Catalog) (Plan, error) {
+func Build(ctx context.Context, ast parser.AST, catalog *schema.Catalog) (Plan, error) {
 	switch ast.Type {
 	case parser.SelectStmt:
-		return buildSelect(ast, catalog)
+		return buildSelect(ctx, ast, catalog)
 	case parser.BeginStmt:
 		return Plan{Root: &TxnOp{Action: TxnBegin}}, nil
 	case parser.CommitStmt:
@@ -149,23 +151,27 @@ func Build(ast parser.AST, catalog *schema.Catalog) (Plan, error) {
 	case parser.DropIndexStmt:
 		return buildDropIndex(ast, catalog)
 	case parser.InsertStmt:
-		return buildInsert(ast, catalog)
+		return buildInsert(ctx, ast, catalog)
 	case parser.UpdateStmt:
-		return buildUpdate(ast, catalog)
+		return buildUpdate(ctx, ast, catalog)
 	case parser.DeleteStmt:
-		return buildDelete(ast, catalog)
+		return buildDelete(ctx, ast, catalog)
 	default:
 		return Plan{}, fmt.Errorf("planner: unsupported statement %s", ast.Type)
 	}
 }
 
-func buildSelect(ast parser.AST, catalog *schema.Catalog) (Plan, error) {
+func buildSelect(ctx context.Context, ast parser.AST, catalog *schema.Catalog) (Plan, error) {
+	if catalog == nil {
+		return Plan{}, fmt.Errorf("planner: catalog required for SELECT")
+	}
+
 	if ast.TableName == "" {
 		return Plan{}, fmt.Errorf("planner: select missing table")
 	}
 
 	// Check if we can use an index using the structured expression
-	if catalog != nil && ast.WhereExpr != nil {
+	if ast.WhereExpr != nil {
 		if indexScan := tryIndexScan(ast.WhereExpr, catalog, ast.SchemaName, ast.TableName); indexScan != nil {
 			// Copy filter string for backward compatibility/logging
 			indexScan.Filter = ast.Where
@@ -174,7 +180,7 @@ func buildSelect(ast parser.AST, catalog *schema.Catalog) (Plan, error) {
 	}
 
 	// Fallback to string-based check if WhereExpr is nil but Where string exists (backward compat)
-	if catalog != nil && ast.Where != "" && ast.WhereExpr == nil {
+	if ast.Where != "" && ast.WhereExpr == nil {
 		// Simple check for "col = val"
 		// We split by "=" and check if the left side is an indexed column.
 		parts := strings.Split(ast.Where, "=")
@@ -316,7 +322,7 @@ func buildDropIndex(ast parser.AST, catalog *schema.Catalog) (Plan, error) {
 	return Plan{Root: op}, nil
 }
 
-func buildInsert(ast parser.AST, catalog *schema.Catalog) (Plan, error) {
+func buildInsert(ctx context.Context, ast parser.AST, catalog *schema.Catalog) (Plan, error) {
 	if ast.Insert == nil {
 		return Plan{}, fmt.Errorf("planner: INSERT spec missing")
 	}
@@ -325,12 +331,15 @@ func buildInsert(ast parser.AST, catalog *schema.Catalog) (Plan, error) {
 	}
 
 	spec := ast.Insert
+	logging.DebugContext(ctx, "[Planner] Building INSERT plan for table %s.%s", spec.Schema, spec.Table)
 
 	// Get table schema from catalog
+	logging.DebugContext(ctx, "[Planner] Validating table schema for %s.%s", spec.Schema, spec.Table)
 	tableDef, err := catalog.GetTable(spec.Schema, spec.Table)
 	if err != nil {
 		return Plan{}, fmt.Errorf("planner: table %s.%s not found: %w", spec.Schema, spec.Table, err)
 	}
+	logging.DebugContext(ctx, "[Planner] Table has %d columns defined", len(tableDef.Columns))
 
 	// Determine columns (use all if not specified)
 	columns := spec.Columns
@@ -347,6 +356,7 @@ func buildInsert(ast parser.AST, catalog *schema.Catalog) (Plan, error) {
 	}
 
 	// Validate columns exist and encode values
+	logging.DebugContext(ctx, "[Planner] Encoding %d values for INSERT", len(columns))
 	encodedValues := make([][]byte, len(columns))
 	for i, colName := range columns {
 		// Find column in table def
@@ -376,6 +386,7 @@ func buildInsert(ast parser.AST, catalog *schema.Catalog) (Plan, error) {
 		}
 		encodedValues[i] = encoded
 	}
+	logging.DebugContext(ctx, "[Planner] Successfully encoded all values")
 
 	op := &InsertOp{
 		Schema:  spec.Schema,
@@ -383,10 +394,11 @@ func buildInsert(ast parser.AST, catalog *schema.Catalog) (Plan, error) {
 		Columns: columns,
 		Values:  encodedValues,
 	}
+	logging.DebugContext(ctx, "[Planner] Created InsertOp for %s.%s with %d columns", spec.Schema, spec.Table, len(columns))
 	return Plan{Root: op}, nil
 }
 
-func buildUpdate(ast parser.AST, catalog *schema.Catalog) (Plan, error) {
+func buildUpdate(ctx context.Context, ast parser.AST, catalog *schema.Catalog) (Plan, error) {
 	if ast.Update == nil {
 		return Plan{}, fmt.Errorf("planner: UPDATE spec missing")
 	}
@@ -441,7 +453,7 @@ func buildUpdate(ast parser.AST, catalog *schema.Catalog) (Plan, error) {
 	return Plan{Root: op}, nil
 }
 
-func buildDelete(ast parser.AST, catalog *schema.Catalog) (Plan, error) {
+func buildDelete(ctx context.Context, ast parser.AST, catalog *schema.Catalog) (Plan, error) {
 	if ast.Delete == nil {
 		return Plan{}, fmt.Errorf("planner: DELETE spec missing")
 	}

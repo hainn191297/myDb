@@ -1,12 +1,13 @@
 package parser
 
 import (
+	"context"
 	"testing"
 )
 
 func TestParseInsert(t *testing.T) {
 	sql := "INSERT INTO users VALUES (1, 'alice', true)"
-	ast, err := Parse(sql)
+	ast, err := Parse(context.Background(), sql)
 	if err != nil {
 		t.Fatalf("Parse INSERT: %v", err)
 	}
@@ -31,7 +32,7 @@ func TestParseInsert(t *testing.T) {
 
 func TestParseInsertWithColumns(t *testing.T) {
 	sql := "INSERT INTO users (id, name) VALUES (1, 'alice')"
-	ast, err := Parse(sql)
+	ast, err := Parse(context.Background(), sql)
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
@@ -45,7 +46,7 @@ func TestParseInsertWithColumns(t *testing.T) {
 
 func TestParseInsertWithSchema(t *testing.T) {
 	sql := "INSERT INTO public.users VALUES (1)"
-	ast, err := Parse(sql)
+	ast, err := Parse(context.Background(), sql)
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
@@ -56,7 +57,7 @@ func TestParseInsertWithSchema(t *testing.T) {
 
 func TestParseUpdate(t *testing.T) {
 	sql := "UPDATE users SET name = 'bob', active = false WHERE id = 1"
-	ast, err := Parse(sql)
+	ast, err := Parse(context.Background(), sql)
 	if err != nil {
 		t.Fatalf("Parse UPDATE: %v", err)
 	}
@@ -84,7 +85,7 @@ func TestParseUpdate(t *testing.T) {
 
 func TestParseUpdateNoWhere(t *testing.T) {
 	sql := "UPDATE users SET name = 'bob'"
-	ast, err := Parse(sql)
+	ast, err := Parse(context.Background(), sql)
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
@@ -95,7 +96,7 @@ func TestParseUpdateNoWhere(t *testing.T) {
 
 func TestParseDelete(t *testing.T) {
 	sql := "DELETE FROM users WHERE id = 1"
-	ast, err := Parse(sql)
+	ast, err := Parse(context.Background(), sql)
 	if err != nil {
 		t.Fatalf("Parse DELETE: %v", err)
 	}
@@ -117,7 +118,7 @@ func TestParseDelete(t *testing.T) {
 
 func TestParseDeleteNoWhere(t *testing.T) {
 	sql := "DELETE FROM users"
-	ast, err := Parse(sql)
+	ast, err := Parse(context.Background(), sql)
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
@@ -137,7 +138,7 @@ func TestParseDMLErrors(t *testing.T) {
 	}
 
 	for _, sql := range tests {
-		_, err := Parse(sql)
+		_, err := Parse(context.Background(), sql)
 		if err == nil {
 			t.Errorf("expected error for %q, got nil", sql)
 		}

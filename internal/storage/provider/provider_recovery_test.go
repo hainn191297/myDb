@@ -38,11 +38,11 @@ func TestProviderRecoveryRestoresData(t *testing.T) {
 
 	// insert a row
 	insertSQL := "INSERT INTO users VALUES (1, 'alice')"
-	ast, err := parser.Parse(insertSQL)
+	ast, err := parser.Parse(context.Background(), insertSQL)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	plan, err := planner.Build(ast, cat)
+	plan, err := planner.Build(context.Background(), ast, cat)
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
@@ -90,11 +90,11 @@ func TestProviderRecoveryRestoresData(t *testing.T) {
 	}
 
 	selectSQL := "SELECT * FROM users WHERE id = 1"
-	ast, err = parser.Parse(selectSQL)
+	ast, err = parser.Parse(context.Background(), selectSQL)
 	if err != nil {
 		t.Fatalf("parse select: %v", err)
 	}
-	plan, err = planner.Build(ast, cat2)
+	plan, err = planner.Build(context.Background(), ast, cat2)
 	if err != nil {
 		t.Fatalf("plan select: %v", err)
 	}

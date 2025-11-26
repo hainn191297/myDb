@@ -33,8 +33,8 @@ func TestPrimaryKeyIndexIntegration(t *testing.T) {
 
 	// 3. Create table with PRIMARY KEY
 	createSQL := "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, email TEXT)"
-	ast, _ := parser.Parse(createSQL)
-	plan, _ := planner.Build(ast, catalog)
+	ast, _ := parser.Parse(context.Background(), createSQL)
+	plan, _ := planner.Build(context.Background(), ast, catalog)
 	exec := New(plan, Options{Catalog: catalog, Provider: prov})
 	if _, err = exec.Next(ctx); err != nil {
 		// If table exists, ignore (for now, but better to fix setup)
@@ -55,8 +55,8 @@ func TestPrimaryKeyIndexIntegration(t *testing.T) {
 			continue // Just insert 3 rows for test
 		}
 
-		ast, _ := parser.Parse(insertSQL)
-		plan, _ := planner.Build(ast, catalog)
+		ast, _ := parser.Parse(context.Background(), insertSQL)
+		plan, _ := planner.Build(context.Background(), ast, catalog)
 		exec := New(plan, Options{Catalog: catalog, Provider: prov})
 		if _, err := exec.Next(ctx); err != nil {
 			t.Fatalf("INSERT row %d: %v", i, err)
@@ -65,8 +65,8 @@ func TestPrimaryKeyIndexIntegration(t *testing.T) {
 
 	// 5. Test Get via SELECT - should use PK index (O(log n))
 	selectSQL := "SELECT * FROM users WHERE id = 2"
-	ast, _ = parser.Parse(selectSQL)
-	plan, _ = planner.Build(ast, catalog)
+	ast, _ = parser.Parse(context.Background(), selectSQL)
+	plan, _ = planner.Build(context.Background(), ast, catalog)
 	exec = New(plan, Options{Catalog: catalog, Provider: prov})
 
 	ok, err := exec.Next(ctx)
@@ -122,8 +122,8 @@ func TestPrimaryKeyIndexUpdate(t *testing.T) {
 	executeDML(ctx, catalog, prov, "UPDATE items SET qty = 10 WHERE id = 100")
 
 	// Verify
-	ast, _ := parser.Parse("SELECT qty FROM items WHERE id = 100")
-	plan, _ := planner.Build(ast, catalog)
+	ast, _ := parser.Parse(context.Background(), "SELECT qty FROM items WHERE id = 100")
+	plan, _ := planner.Build(context.Background(), ast, catalog)
 	exec := New(plan, Options{Catalog: catalog, Provider: prov})
 
 	ok, _ := exec.Next(ctx)
@@ -171,8 +171,8 @@ func TestPrimaryKeyIndexDelete(t *testing.T) {
 	executeDML(ctx, catalog, prov, "DELETE FROM products WHERE id = 1")
 
 	// Verify id=1 gone, id=2 remains
-	ast, _ := parser.Parse("SELECT * FROM products WHERE id = 1")
-	plan, _ := planner.Build(ast, catalog)
+	ast, _ := parser.Parse(context.Background(), "SELECT * FROM products WHERE id = 1")
+	plan, _ := planner.Build(context.Background(), ast, catalog)
 	exec := New(plan, Options{Catalog: catalog, Provider: prov})
 
 	ok, _ := exec.Next(ctx)
@@ -180,8 +180,8 @@ func TestPrimaryKeyIndexDelete(t *testing.T) {
 		t.Error("Expected id=1 to be deleted")
 	}
 
-	ast, _ = parser.Parse("SELECT * FROM products WHERE id = 2")
-	plan, _ = planner.Build(ast, catalog)
+	ast, _ = parser.Parse(context.Background(), "SELECT * FROM products WHERE id = 2")
+	plan, _ = planner.Build(context.Background(), ast, catalog)
 	exec = New(plan, Options{Catalog: catalog, Provider: prov})
 
 	ok, _ = exec.Next(ctx)

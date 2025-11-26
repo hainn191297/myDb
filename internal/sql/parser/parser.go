@@ -1,10 +1,12 @@
 package parser
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
 	dberrors "github.com/hainn191297/myDb/internal/errors"
+	"github.com/hainn191297/myDb/internal/logging"
 	"github.com/hainn191297/myDb/internal/sql/expr"
 )
 
@@ -111,7 +113,7 @@ const (
 // Parse converts SQL text into an AST for a limited subset of statements. The
 // goal is to provide a structured representation that future planners/executors
 // can build upon while more sophisticated parsing is implemented later.
-func Parse(sql string) (AST, error) {
+func Parse(ctx context.Context, sql string) (AST, error) {
 	trimmed := strings.TrimSpace(sql)
 	trimmed = strings.TrimSuffix(trimmed, ";")
 	trimmed = strings.TrimSpace(trimmed)
@@ -131,7 +133,7 @@ func Parse(sql string) (AST, error) {
 	case strings.HasPrefix(upper, "SELECT"):
 		return parseSelect(trimmed)
 	case strings.HasPrefix(upper, "INSERT INTO"):
-		return parseInsert(trimmed)
+		return parseInsert(ctx, trimmed)
 	case strings.HasPrefix(upper, "UPDATE"):
 		return parseUpdate(trimmed)
 	case strings.HasPrefix(upper, "DELETE FROM"):
@@ -480,7 +482,9 @@ func parseColumnDef(def string) (ColumnSpec, error) {
 //
 //	INSERT INTO users VALUES (1, 'alice', true)
 //	INSERT INTO users (id, name) VALUES (1, 'alice')
-func parseInsert(sql string) (AST, error) {
+func parseInsert(ctx context.Context, sql string) (AST, error) {
+	logging.DebugContext(ctx, "[Parser] Parsing INSERT statement")
+
 	upper := strings.ToUpper(sql)
 	if !strings.HasPrefix(upper, "INSERT INTO ") {
 		return AST{}, fmt.Errorf("parser: invalid INSERT syntax")
@@ -526,6 +530,9 @@ func parseInsert(sql string) (AST, error) {
 
 	valuesInner := strings.TrimSpace(valuesPart[1 : len(valuesPart)-1])
 	values := parseValues(valuesInner)
+
+	logging.DebugContext(ctx, "[Parser] Successfully parsed INSERT into %s.%s with %d values, %d columns",
+		schema, table, len(values), len(columns))
 
 	return AST{
 		Type: InsertStmt,

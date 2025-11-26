@@ -465,3 +465,40 @@ func (it *heapIterator) Close() error {
 	it.kvs = nil
 	return nil
 }
+
+// RebuildPKIndex scans the heap table and repopulates the primary key index.
+// This is used on startup to restore the in-memory index from disk data.
+func (h *HeapEngine) RebuildPKIndex(ctx context.Context) error {
+	idxEng, hasIndex := h.getPKIndexEngine()
+	if !hasIndex {
+		return nil // No PK index to rebuild
+	}
+
+	t := NewTable(h.schema, h.table, h.tm, h.bm)
+
+	// Scan all pages and slots directly to get physical location
+	return t.Scan(func(pid page.PageID, slot int, off uint16, pg *page.Page) bool {
+		if err := ctx.Err(); err != nil {
+			return false
+		}
+
+		// Decode tuple
+		tupleData := pg.Data[off:]
+		key, _, err := decodeTuple(tupleData)
+		if err != nil {
+			// Skip corrupt tuple? Or fail?
+			// For now, log/skip
+			return true
+		}
+
+		// Insert into index
+		location := encodeLocation(pid, slot)
+		if err := idxEng.Insert(key, location); err != nil {
+			// If duplicate key in index, it means data corruption or duplicate data on disk.
+			// We should probably continue or error.
+			// For now, continue.
+		}
+
+		return true
+	})
+}

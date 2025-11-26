@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/hainn191297/myDb/internal/schema"
@@ -123,7 +124,112 @@ func (p *Provider) LoadCatalog(ctx context.Context) (*schema.Catalog, error) {
 	if err := cat.LoadSystemTables(ctx); err != nil {
 		return nil, fmt.Errorf("provider: load catalog: %w", err)
 	}
+
+	// Set catalog in provider so engines can access schema (needed for PK index)
+	p.SetCatalog(cat)
+
+	// Rebuild in-memory indexes from data
+	if err := p.RebuildIndexes(ctx, cat); err != nil {
+		return nil, fmt.Errorf("provider: rebuild indexes: %w", err)
+	}
+
 	return cat, nil
+}
+
+// RebuildIndexes scans all tables and repopulates their in-memory indexes.
+// This is necessary because the B+Tree implementation is currently in-memory only.
+func (p *Provider) RebuildIndexes(ctx context.Context, cat *schema.Catalog) error {
+	// 1. Get all tables
+	// We can't iterate catalog directly easily without exposing internals.
+	// But we can iterate the "tables" system table.
+	// Or we can just rely on the fact that we need to support this.
+	// For now, let's assume we can get a list of tables from the catalog if we added a method,
+	// or we can scan the system table manually.
+
+	// Let's use the catalog's internal knowledge if possible, but it's not exposed.
+	// So we scan the system table "tables".
+	tablesEng, err := p.Engine(schema.SystemSchema, schema.CatalogTablesTable)
+	if err != nil {
+		return err
+	}
+
+	iter, err := tablesEng.Scan(ctx, nil, nil)
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+
+	for iter.Next() {
+		// Decode table definition
+		// We can use catalog.GetTable if we know the name.
+		// The key in system table is "schema.table".
+		// The value is the JSON definition.
+		// But wait, we can just use the catalog!
+		// The catalog has loaded system tables, but it doesn't expose a "ListTables" method.
+		// We should probably add one, or just hack it here by scanning the system table.
+
+		// Key is schema.table
+		keyStr := string(iter.Key())
+		parts := strings.Split(keyStr, ".")
+		if len(parts) != 2 {
+			continue
+		}
+		schemaName, tableName := parts[0], parts[1]
+
+		// Skip system tables
+		if schemaName == schema.SystemSchema {
+			continue
+		}
+
+		tableDef, err := cat.GetTable(schemaName, tableName)
+		if err != nil {
+			return fmt.Errorf("get table %s.%s: %w", schemaName, tableName, err)
+		}
+
+		// Get indexes for this table
+		indexes, err := cat.GetIndexes(schemaName, tableName)
+		if err != nil {
+			return fmt.Errorf("get indexes for %s.%s: %w", schemaName, tableName, err)
+		}
+
+		if len(indexes) == 0 {
+			continue
+		}
+
+		// Rebuild indexes for this table
+		if err := p.rebuildTableIndexes(ctx, tableDef, indexes); err != nil {
+			return fmt.Errorf("rebuild indexes for %s.%s: %w", schemaName, tableName, err)
+		}
+	}
+
+	return nil
+}
+
+func (p *Provider) rebuildTableIndexes(ctx context.Context, tableDef *schema.TableDef, indexes []schema.IndexDef) error {
+	// Open table engine
+	eng, err := p.Engine(tableDef.Schema, tableDef.Table)
+	if err != nil {
+		return err
+	}
+
+	// Open all index engines
+	idxEngines := make([]engine.IndexEngine, len(indexes))
+	for i, idx := range indexes {
+		idxEng, err := p.Index(tableDef.Schema, tableDef.Table, idx.IndexName)
+		if err != nil {
+			return err
+		}
+		idxEngines[i] = idxEng
+	}
+
+	// Delegate to the engine if it supports rebuilding its PK index
+	if heapEng, ok := eng.(interface{ RebuildPKIndex(context.Context) error }); ok {
+		if err := heapEng.RebuildPKIndex(ctx); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // Close releases file handles via the TableManager.

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/hainn191297/myDb/internal/logging"
 	"github.com/hainn191297/myDb/internal/schema"
 	"github.com/hainn191297/myDb/internal/sql/planner"
 	"github.com/hainn191297/myDb/internal/storage/engine"
@@ -52,6 +53,7 @@ type Executor struct {
 	current  Row
 	started  bool
 	closed   bool
+	isPKScan bool // NEW: track if current index scan is on PK
 }
 
 type columnKind int
@@ -162,11 +164,6 @@ func (e *Executor) nextSeqScan(ctx context.Context, op *planner.SeqScanOp) (bool
 		key := append([]byte(nil), e.dataIter.Key()...)
 		val := append([]byte(nil), e.dataIter.Value()...)
 
-		// Simple WHERE clause check (string contains for MVP)
-		if op.Filter != "" && !e.matchesFilter(op.Schema, op.Table, key, val, op.Filter) {
-			continue
-		}
-
 		// Decode row if needed
 		var decodedValues [][]byte
 		if e.tableDef != nil {
@@ -177,6 +174,7 @@ func (e *Executor) nextSeqScan(ctx context.Context, op *planner.SeqScanOp) (bool
 			}
 		}
 
+		// Build a temporary row for filtering
 		values := make([][]byte, len(e.rowSpecs))
 		cols := make([]string, len(e.rowSpecs))
 		for i, spec := range e.rowSpecs {
@@ -196,6 +194,21 @@ func (e *Executor) nextSeqScan(ctx context.Context, op *planner.SeqScanOp) (bool
 				}
 			}
 		}
+
+		// Apply filter using FilterExpr if available, otherwise fall back to string filter
+		if op.FilterExpr != nil {
+			tempRow := Row{Columns: cols, Values: values}
+			match, err := evaluateFilter(ctx, op.FilterExpr, tempRow, e.tableDef)
+			if err != nil {
+				return false, fmt.Errorf("executor: evaluate filter: %w", err)
+			}
+			if !match {
+				continue
+			}
+		} else if op.Filter != "" && !e.matchesFilter(op.Schema, op.Table, key, val, op.Filter) {
+			continue
+		}
+
 		e.current = Row{Columns: cols, Values: values}
 		return true, nil
 	}
@@ -397,6 +410,20 @@ func (e *Executor) executeCreateTable(ctx context.Context, op *planner.CreateTab
 		}
 	}
 
+	// CRITICAL: Flush catalog changes to disk immediately.
+	// DDL operations bypass transactions, so we must manually flush buffer pool
+	// and sync WAL to ensure catalog metadata is durable.
+	if flusher, ok := e.provider.(interface{ FlushAll() error }); ok {
+		if err := flusher.FlushAll(); err != nil {
+			return fmt.Errorf("executor: flush catalog: %w", err)
+		}
+	}
+	if syncer, ok := e.provider.(interface{ SyncAll() error }); ok {
+		if err := syncer.SyncAll(); err != nil {
+			return fmt.Errorf("executor: sync WAL: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -410,10 +437,24 @@ func (e *Executor) executeDropTable(ctx context.Context, op *planner.DropTableOp
 		return fmt.Errorf("executor: drop table %s.%s: %w", op.Schema, op.Table, err)
 	}
 
+	// Flush catalog changes to disk
+	if flusher, ok := e.provider.(interface{ FlushAll() error }); ok {
+		if err := flusher.FlushAll(); err != nil {
+			return fmt.Errorf("executor: flush catalog: %w", err)
+		}
+	}
+	if syncer, ok := e.provider.(interface{ SyncAll() error }); ok {
+		if err := syncer.SyncAll(); err != nil {
+			return fmt.Errorf("executor: sync WAL: %w", err)
+		}
+	}
+
 	return nil
 }
 
 func (e *Executor) executeInsert(ctx context.Context, op *planner.InsertOp) error {
+	logging.DebugContext(ctx, "[Executor] Starting INSERT execution for %s.%s", op.Schema, op.Table)
+
 	if e.provider == nil {
 		return errors.New("executor: storage provider not configured")
 	}
@@ -423,6 +464,7 @@ func (e *Executor) executeInsert(ctx context.Context, op *planner.InsertOp) erro
 	if err != nil {
 		return fmt.Errorf("executor: resolve engine for %s.%s: %w", op.Schema, op.Table, err)
 	}
+	logging.DebugContext(ctx, "[Executor] Resolved storage engine for %s.%s", op.Schema, op.Table)
 
 	// Encode row: [len1][val1][len2][val2]...
 	var rowData []byte
@@ -441,10 +483,22 @@ func (e *Executor) executeInsert(ctx context.Context, op *planner.InsertOp) erro
 	// In a real DB, you'd use a primary key or auto-increment
 	key := op.Values[0]
 
+	// Check for duplicate primary key
+	// We only check if it's a primary key insert. For now, we assume the first column is the PK.
+	// In a real implementation, we should check table definition.
+	// But based on current logic, key is always op.Values[0].
+	if _, err := eng.Get(ctx, key); err == nil {
+		logging.WarnContext(ctx, "[Executor] Duplicate primary key detected: %x", key)
+		return fmt.Errorf("executor: duplicate primary key: %v", key)
+	} else if !errors.Is(err, engine.ErrKeyNotFound) {
+		return fmt.Errorf("executor: check duplicate key: %w", err)
+	}
+
 	// Store row
 	if err := eng.Put(ctx, key, rowData); err != nil {
 		return fmt.Errorf("executor: insert into %s.%s: %w", op.Schema, op.Table, err)
 	}
+	logging.DebugContext(ctx, "[Executor] Row inserted into storage engine")
 
 	// Maintain Indexes
 	indexes, err := e.catalog.GetIndexes(op.Schema, op.Table)
@@ -453,6 +507,10 @@ func (e *Executor) executeInsert(ctx context.Context, op *planner.InsertOp) erro
 	}
 
 	for _, idx := range indexes {
+		if idx.IsPrimaryKey {
+			continue // HeapEngine handles PK index maintenance
+		}
+
 		idxEng, err := e.provider.Index(op.Schema, op.Table, idx.IndexName)
 		if err != nil {
 			return fmt.Errorf("executor: open index %s: %w", idx.IndexName, err)
@@ -472,8 +530,22 @@ func (e *Executor) executeInsert(ctx context.Context, op *planner.InsertOp) erro
 		if err := idxEng.Insert(indexKey, key); err != nil {
 			return fmt.Errorf("executor: insert into index %s: %w", idx.IndexName, err)
 		}
+		logging.DebugContext(ctx, "[Executor] Updated index %s", idx.IndexName)
 	}
 
+	// Flush data to disk for durability
+	if flusher, ok := e.provider.(interface{ FlushAll() error }); ok {
+		if err := flusher.FlushAll(); err != nil {
+			return fmt.Errorf("executor: flush data: %w", err)
+		}
+	}
+	if syncer, ok := e.provider.(interface{ SyncAll() error }); ok {
+		if err := syncer.SyncAll(); err != nil {
+			return fmt.Errorf("executor: sync WAL: %w", err)
+		}
+	}
+
+	logging.InfoContext(ctx, "[Executor] INSERT completed successfully for %s.%s", op.Schema, op.Table)
 	return nil
 }
 
@@ -509,15 +581,30 @@ func (e *Executor) executeUpdate(ctx context.Context, op *planner.UpdateOp) erro
 		key := iter.Key()
 		rowData := iter.Value()
 
-		// Simple WHERE clause check
-		if op.Filter != "" && !e.matchesFilter(op.Schema, op.Table, key, rowData, op.Filter) {
-			continue
-		}
-
 		// Decode row
 		oldValues, err := decodeRow(rowData, len(tableDef.Columns))
 		if err != nil {
 			return fmt.Errorf("executor: decode row: %w", err)
+		}
+
+		// Evaluate filter using FilterExpr if available
+		if op.FilterExpr != nil {
+			// Build row with column names
+			cols := make([]string, len(tableDef.Columns))
+			for i, col := range tableDef.Columns {
+				cols[i] = col.Name
+			}
+
+			tempRow := Row{Columns: cols, Values: oldValues}
+			match, err := evaluateFilter(ctx, op.FilterExpr, tempRow, tableDef)
+			if err != nil {
+				return fmt.Errorf("executor: evaluate filter: %w", err)
+			}
+			if !match {
+				continue
+			}
+		} else if op.Filter != "" && !e.matchesFilter(op.Schema, op.Table, key, rowData, op.Filter) {
+			continue
 		}
 
 		// Create new values (copy)
@@ -555,6 +642,10 @@ func (e *Executor) executeUpdate(ctx context.Context, op *planner.UpdateOp) erro
 		}
 
 		for _, idx := range indexes {
+			if idx.IsPrimaryKey {
+				continue // HeapEngine handles PK index maintenance
+			}
+
 			idxEng, err := e.provider.Index(op.Schema, op.Table, idx.IndexName)
 			if err != nil {
 				return fmt.Errorf("executor: open index %s: %w", idx.IndexName, err)
@@ -585,6 +676,18 @@ func (e *Executor) executeUpdate(ctx context.Context, op *planner.UpdateOp) erro
 		return fmt.Errorf("executor: iterator error: %w", err)
 	}
 
+	// Flush data to disk for durability
+	if flusher, ok := e.provider.(interface{ FlushAll() error }); ok {
+		if err := flusher.FlushAll(); err != nil {
+			return fmt.Errorf("executor: flush data: %w", err)
+		}
+	}
+	if syncer, ok := e.provider.(interface{ SyncAll() error }); ok {
+		if err := syncer.SyncAll(); err != nil {
+			return fmt.Errorf("executor: sync WAL: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -606,14 +709,41 @@ func (e *Executor) executeDelete(ctx context.Context, op *planner.DeleteOp) erro
 	}
 	defer iter.Close()
 
+	// Scan table and get table definition
+	tableDef, err := e.catalog.GetTable(op.Schema, op.Table)
+	if err != nil {
+		return fmt.Errorf("executor: get table definition: %w", err)
+	}
+
 	// Collect keys to delete (can't delete while iterating)
 	var keysToDelete [][]byte
 	for iter.Next() {
 		key := iter.Key()
 		rowData := iter.Value()
 
-		// Simple WHERE clause check
-		if op.Filter != "" && !e.matchesFilter(op.Schema, op.Table, key, rowData, op.Filter) {
+		// Evaluate filter using FilterExpr if available
+		if op.FilterExpr != nil {
+			// Decode row for filtering
+			values, err := decodeRow(rowData, len(tableDef.Columns))
+			if err != nil {
+				return fmt.Errorf("executor: decode row for filter: %w", err)
+			}
+
+			// Build row with column names
+			cols := make([]string, len(tableDef.Columns))
+			for i, col := range tableDef.Columns {
+				cols[i] = col.Name
+			}
+
+			tempRow := Row{Columns: cols, Values: values}
+			match, err := evaluateFilter(ctx, op.FilterExpr, tempRow, tableDef)
+			if err != nil {
+				return fmt.Errorf("executor: evaluate filter: %w", err)
+			}
+			if !match {
+				continue
+			}
+		} else if op.Filter != "" && !e.matchesFilter(op.Schema, op.Table, key, rowData, op.Filter) {
 			continue
 		}
 
@@ -653,6 +783,10 @@ func (e *Executor) executeDelete(ctx context.Context, op *planner.DeleteOp) erro
 		}
 
 		for _, idx := range indexes {
+			if idx.IsPrimaryKey {
+				continue // HeapEngine handles PK index maintenance
+			}
+
 			idxEng, err := e.provider.Index(op.Schema, op.Table, idx.IndexName)
 			if err != nil {
 				return err
@@ -671,6 +805,18 @@ func (e *Executor) executeDelete(ctx context.Context, op *planner.DeleteOp) erro
 
 		if err := eng.Delete(ctx, key); err != nil {
 			return fmt.Errorf("executor: delete row: %w", err)
+		}
+	}
+
+	// Flush data to disk for durability
+	if flusher, ok := e.provider.(interface{ FlushAll() error }); ok {
+		if err := flusher.FlushAll(); err != nil {
+			return fmt.Errorf("executor: flush data: %w", err)
+		}
+	}
+	if syncer, ok := e.provider.(interface{ SyncAll() error }); ok {
+		if err := syncer.SyncAll(); err != nil {
+			return fmt.Errorf("executor: sync WAL: %w", err)
 		}
 	}
 
@@ -833,6 +979,18 @@ func (e *Executor) executeCreateIndex(ctx context.Context, op *planner.CreateInd
 		return fmt.Errorf("executor: iterator error: %w", err)
 	}
 
+	// Flush index data to disk
+	if flusher, ok := e.provider.(interface{ FlushAll() error }); ok {
+		if err := flusher.FlushAll(); err != nil {
+			return fmt.Errorf("executor: flush index: %w", err)
+		}
+	}
+	if syncer, ok := e.provider.(interface{ SyncAll() error }); ok {
+		if err := syncer.SyncAll(); err != nil {
+			return fmt.Errorf("executor: sync WAL: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -848,6 +1006,18 @@ func (e *Executor) executeDropIndex(ctx context.Context, op *planner.DropIndexOp
 
 	// Note: Physical file deletion is not yet implemented in EngineProvider interface.
 	// For MVP, leaving the file is acceptable (or we could extend interface).
+
+	// Flush catalog changes to disk
+	if flusher, ok := e.provider.(interface{ FlushAll() error }); ok {
+		if err := flusher.FlushAll(); err != nil {
+			return fmt.Errorf("executor: flush catalog: %w", err)
+		}
+	}
+	if syncer, ok := e.provider.(interface{ SyncAll() error }); ok {
+		if err := syncer.SyncAll(); err != nil {
+			return fmt.Errorf("executor: sync WAL: %w", err)
+		}
+	}
 
 	return nil
 }
@@ -885,7 +1055,20 @@ func (e *Executor) nextIndexScan(ctx context.Context, op *planner.IndexScanOp) (
 			return false, fmt.Errorf("executor: resolve table engine: %w", err)
 		}
 
-		rowData, err := tableEng.Get(ctx, rowKey)
+		var rowData []byte
+		if e.isPKScan {
+			// PK index stores Location, not User Key
+			if heapEng, ok := tableEng.(interface {
+				GetByLocation(context.Context, []byte) ([]byte, error)
+			}); ok {
+				rowData, err = heapEng.GetByLocation(ctx, rowKey)
+			} else {
+				return false, fmt.Errorf("executor: engine does not support GetByLocation")
+			}
+		} else {
+			rowData, err = tableEng.Get(ctx, rowKey)
+		}
+
 		if err != nil {
 			return false, fmt.Errorf("executor: fetch row from heap: %w", err)
 		}
@@ -957,6 +1140,18 @@ func (e *Executor) initIndexScan(ctx context.Context, op *planner.IndexScanOp) e
 		return err
 	}
 	e.tableDef = tableDef
+
+	// Check if this is a PK index scan
+	indexes, err := e.catalog.GetIndexes(op.Schema, op.Table)
+	if err != nil {
+		return err
+	}
+	for _, idx := range indexes {
+		if idx.IndexName == op.IndexName {
+			e.isPKScan = idx.IsPrimaryKey
+			break
+		}
+	}
 
 	// Determine scan range
 	// For "col = val", start = val, end = val (or val + 1 for exclusive)

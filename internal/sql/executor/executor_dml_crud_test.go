@@ -20,12 +20,12 @@ func TestExecutorInsert(t *testing.T) {
 
 	// Parse and execute INSERT
 	sql := "INSERT INTO users VALUES (1, 'alice')"
-	ast, err := parser.Parse(sql)
+	ast, err := parser.Parse(context.Background(), sql)
 	if err != nil {
 		t.Fatalf("Parse INSERT: %v", err)
 	}
 
-	plan, err := planner.Build(ast, catalog)
+	plan, err := planner.Build(context.Background(), ast, catalog)
 	if err != nil {
 		t.Fatalf("Build INSERT: %v", err)
 	}
@@ -57,8 +57,8 @@ func TestExecutorUpdate(t *testing.T) {
 
 	// Update
 	sql := "UPDATE users SET name = 'bob'"
-	ast, _ := parser.Parse(sql)
-	plan, _ := planner.Build(ast, catalog)
+	ast, _ := parser.Parse(context.Background(), sql)
+	plan, _ := planner.Build(context.Background(), ast, catalog)
 
 	exec := New(plan, Options{Catalog: catalog, Provider: provider})
 	_, err := exec.Next(ctx)
@@ -87,8 +87,8 @@ func TestExecutorDelete(t *testing.T) {
 
 	// Delete all
 	sql := "DELETE FROM users"
-	ast, _ := parser.Parse(sql)
-	plan, _ := planner.Build(ast, catalog)
+	ast, _ := parser.Parse(context.Background(), sql)
+	plan, _ := planner.Build(context.Background(), ast, catalog)
 
 	exec := New(plan, Options{Catalog: catalog, Provider: provider})
 	_, err := exec.Next(ctx)
@@ -189,12 +189,12 @@ func setupTableEngine(provider *fakeProvider, schema, table string) {
 }
 
 func executeDML(ctx context.Context, catalog *schema.Catalog, provider EngineProvider, sql string) error {
-	ast, err := parser.Parse(sql)
+	ast, err := parser.Parse(context.Background(), sql)
 	if err != nil {
 		return err
 	}
 
-	plan, err := planner.Build(ast, catalog)
+	plan, err := planner.Build(context.Background(), ast, catalog)
 	if err != nil {
 		return err
 	}

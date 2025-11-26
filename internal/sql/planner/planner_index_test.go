@@ -11,12 +11,12 @@ import (
 
 func TestPlanCreateIndex(t *testing.T) {
 	sql := "CREATE INDEX idx_email ON users (email)"
-	ast, err := parser.Parse(sql)
+	ast, err := parser.Parse(context.Background(), sql)
 	if err != nil {
 		t.Fatalf("Parse failed: %v", err)
 	}
 
-	plan, err := Build(ast, nil)
+	plan, err := Build(context.Background(), ast, nil)
 	if err != nil {
 		t.Fatalf("Build failed: %v", err)
 	}
@@ -42,12 +42,12 @@ func TestPlanCreateIndex(t *testing.T) {
 
 func TestPlanDropIndex(t *testing.T) {
 	sql := "DROP INDEX idx_email ON users"
-	ast, err := parser.Parse(sql)
+	ast, err := parser.Parse(context.Background(), sql)
 	if err != nil {
 		t.Fatalf("Parse failed: %v", err)
 	}
 
-	plan, err := Build(ast, nil)
+	plan, err := Build(context.Background(), ast, nil)
 	if err != nil {
 		t.Fatalf("Build failed: %v", err)
 	}
@@ -108,12 +108,12 @@ func TestPlanIndexScanSelection(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ast, err := parser.Parse(tt.sql)
+			ast, err := parser.Parse(context.Background(), tt.sql)
 			if err != nil {
 				t.Fatalf("Parse failed: %v", err)
 			}
 
-			plan, err := Build(ast, catalog)
+			plan, err := Build(context.Background(), ast, catalog)
 			if err != nil {
 				t.Fatalf("Build failed: %v", err)
 			}

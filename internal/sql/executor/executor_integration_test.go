@@ -58,8 +58,8 @@ func TestExecutorIntegration_EndToEnd(t *testing.T) {
 	// 4. SELECT with Index Scan (age = 25)
 	// We need to ensure planner picks IndexScan.
 	sql = "SELECT * FROM users WHERE age = 25"
-	ast, _ := parser.Parse(sql)
-	plan, _ := planner.Build(ast, catalog)
+	ast, _ := parser.Parse(context.Background(), sql)
+	plan, _ := planner.Build(context.Background(), ast, catalog)
 
 	if _, ok := plan.Root.(*planner.IndexScanOp); !ok {
 		t.Fatalf("Expected IndexScanOp for query on indexed column 'age', got %T", plan.Root)
@@ -87,8 +87,8 @@ func TestExecutorIntegration_EndToEnd(t *testing.T) {
 
 	// Verify old index entry is gone
 	sql = "SELECT * FROM users WHERE age = 25"
-	ast, _ = parser.Parse(sql)
-	plan, _ = planner.Build(ast, catalog)
+	ast, _ = parser.Parse(context.Background(), sql)
+	plan, _ = planner.Build(context.Background(), ast, catalog)
 	exec = New(plan, Options{Catalog: catalog, Provider: provider})
 	ok, _ = exec.Next(ctx)
 	if ok {
@@ -97,8 +97,8 @@ func TestExecutorIntegration_EndToEnd(t *testing.T) {
 
 	// Verify new index entry exists
 	sql = "SELECT * FROM users WHERE age = 26"
-	ast, _ = parser.Parse(sql)
-	plan, _ = planner.Build(ast, catalog)
+	ast, _ = parser.Parse(context.Background(), sql)
+	plan, _ = planner.Build(context.Background(), ast, catalog)
 	exec = New(plan, Options{Catalog: catalog, Provider: provider})
 	ok, _ = exec.Next(ctx)
 	if !ok {
@@ -115,8 +115,8 @@ func TestExecutorIntegration_EndToEnd(t *testing.T) {
 
 	// Verify deleted from index
 	sql = "SELECT * FROM users WHERE age = 26"
-	ast, _ = parser.Parse(sql)
-	plan, _ = planner.Build(ast, catalog)
+	ast, _ = parser.Parse(context.Background(), sql)
+	plan, _ = planner.Build(context.Background(), ast, catalog)
 	exec = New(plan, Options{Catalog: catalog, Provider: provider})
 	ok, _ = exec.Next(ctx)
 	if ok {
@@ -128,8 +128,8 @@ func TestExecutorIntegration_EndToEnd(t *testing.T) {
 	// Note: Planner might choose SeqScan or IndexScan for PK depending on implementation.
 	// Currently our heuristic prefers IndexScan if available.
 	// PK creates an index named __pk_users_id
-	ast, _ = parser.Parse(sql)
-	plan, _ = planner.Build(ast, catalog)
+	ast, _ = parser.Parse(context.Background(), sql)
+	plan, _ = planner.Build(context.Background(), ast, catalog)
 	exec = New(plan, Options{Catalog: catalog, Provider: provider})
 	ok, _ = exec.Next(ctx)
 	if ok {

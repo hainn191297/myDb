@@ -30,8 +30,8 @@ func TestInsertDuplicatePrimaryKeyRejected(t *testing.T) {
 	provider.engines["public.users"] = newFakeEngine()
 
 	// first insert ok
-	ast, _ := parser.Parse("INSERT INTO users VALUES (1, 'a@example.com')")
-	plan, err := planner.Build(ast, catalog)
+	ast, _ := parser.Parse(context.Background(), "INSERT INTO users VALUES (1, 'a@example.com')")
+	plan, err := planner.Build(context.Background(), ast, catalog)
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
@@ -41,8 +41,8 @@ func TestInsertDuplicatePrimaryKeyRejected(t *testing.T) {
 	}
 
 	// duplicate pk should fail
-	ast, _ = parser.Parse("INSERT INTO users VALUES (1, 'b@example.com')")
-	plan, err = planner.Build(ast, catalog)
+	ast, _ = parser.Parse(context.Background(), "INSERT INTO users VALUES (1, 'b@example.com')")
+	plan, err = planner.Build(context.Background(), ast, catalog)
 	if err != nil {
 		t.Fatalf("plan dup: %v", err)
 	}
@@ -80,8 +80,8 @@ func TestUpdateUniqueIndexRejected(t *testing.T) {
 		"INSERT INTO users VALUES (1, 'a@example.com')",
 		"INSERT INTO users VALUES (2, 'b@example.com')",
 	} {
-		ast, _ := parser.Parse(sql)
-		plan, err := planner.Build(ast, catalog)
+		ast, _ := parser.Parse(context.Background(), sql)
+		plan, err := planner.Build(context.Background(), ast, catalog)
 		if err != nil {
 			t.Fatalf("plan insert: %v", err)
 		}
@@ -92,8 +92,8 @@ func TestUpdateUniqueIndexRejected(t *testing.T) {
 	}
 
 	// update row 2 to conflicting email should fail
-	ast, _ := parser.Parse("UPDATE users SET email = 'a@example.com' WHERE id = 2")
-	plan, err := planner.Build(ast, catalog)
+	ast, _ := parser.Parse(context.Background(), "UPDATE users SET email = 'a@example.com' WHERE id = 2")
+	plan, err := planner.Build(context.Background(), ast, catalog)
 	if err != nil {
 		t.Fatalf("plan update: %v", err)
 	}

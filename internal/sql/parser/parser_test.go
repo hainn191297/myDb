@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"context"
 	"testing"
 )
 
@@ -15,7 +16,7 @@ func TestParseTxnStatements(t *testing.T) {
 		{"rollback", RollbackStmt},
 	}
 	for _, tt := range tests {
-		ast, err := Parse(tt.sql)
+		ast, err := Parse(context.Background(), tt.sql)
 		if err != nil {
 			t.Fatalf("Parse(%q) unexpected error: %v", tt.sql, err)
 		}
@@ -27,7 +28,7 @@ func TestParseTxnStatements(t *testing.T) {
 
 func TestParseSelect(t *testing.T) {
 	sql := "SELECT id, name FROM public.users WHERE id = 1"
-	ast, err := Parse(sql)
+	ast, err := Parse(context.Background(), sql)
 	if err != nil {
 		t.Fatalf("Parse SELECT: %v", err)
 	}
@@ -46,24 +47,24 @@ func TestParseSelect(t *testing.T) {
 }
 
 func TestParseErrors(t *testing.T) {
-	_, err := Parse("")
+	_, err := Parse(context.Background(), "")
 	if err == nil {
 		t.Fatalf("expected error for empty statement")
 	}
 
-	_, err = Parse("SELECT FROM")
+	_, err = Parse(context.Background(), "SELECT FROM")
 	if err == nil {
 		t.Fatalf("expected error for invalid select")
 	}
 
-	_, err = Parse("UNSUPPORTED")
+	_, err = Parse(context.Background(), "UNSUPPORTED")
 	if err == nil {
 		t.Fatalf("expected error for unsupported statement")
 	}
 }
 
 func TestParseSelectDefaultSchema(t *testing.T) {
-	ast, err := Parse("SELECT * FROM users")
+	ast, err := Parse(context.Background(), "SELECT * FROM users")
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
@@ -74,7 +75,7 @@ func TestParseSelectDefaultSchema(t *testing.T) {
 
 func TestParseCreateTable(t *testing.T) {
 	sql := "CREATE TABLE users (id INT, name TEXT, active BOOL)"
-	ast, err := Parse(sql)
+	ast, err := Parse(context.Background(), sql)
 
 	// logx.Info(ast)
 	if err != nil {
@@ -109,7 +110,7 @@ func TestParseCreateTable(t *testing.T) {
 
 func TestParseCreateTableWithSchema(t *testing.T) {
 	sql := "CREATE TABLE public.orders (order_id INT, total FLOAT)"
-	ast, err := Parse(sql)
+	ast, err := Parse(context.Background(), sql)
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
@@ -120,7 +121,7 @@ func TestParseCreateTableWithSchema(t *testing.T) {
 
 func TestParseCreateTableNotNull(t *testing.T) {
 	sql := "CREATE TABLE users (id INT NOT NULL, name TEXT)"
-	ast, err := Parse(sql)
+	ast, err := Parse(context.Background(), sql)
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
@@ -142,7 +143,7 @@ func TestParseCreateTableErrors(t *testing.T) {
 	}
 
 	for _, sql := range tests {
-		_, err := Parse(sql)
+		_, err := Parse(context.Background(), sql)
 		if err == nil {
 			t.Errorf("expected error for %q, got nil", sql)
 		}
@@ -151,7 +152,7 @@ func TestParseCreateTableErrors(t *testing.T) {
 
 func TestParseDropTable(t *testing.T) {
 	sql := "DROP TABLE users"
-	ast, err := Parse(sql)
+	ast, err := Parse(context.Background(), sql)
 	if err != nil {
 		t.Fatalf("Parse DROP TABLE: %v", err)
 	}
@@ -168,7 +169,7 @@ func TestParseDropTable(t *testing.T) {
 
 func TestParseDropTableWithSchema(t *testing.T) {
 	sql := "DROP TABLE public.orders"
-	ast, err := Parse(sql)
+	ast, err := Parse(context.Background(), sql)
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
@@ -178,7 +179,7 @@ func TestParseDropTableWithSchema(t *testing.T) {
 }
 
 func TestParseDropTableErrors(t *testing.T) {
-	_, err := Parse("DROP TABLE")
+	_, err := Parse(context.Background(), "DROP TABLE")
 	if err == nil {
 		t.Error("expected error for DROP TABLE without table name")
 	}

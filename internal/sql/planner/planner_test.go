@@ -1,6 +1,7 @@
 package planner
 
 import (
+	"context"
 	"testing"
 
 	"github.com/hainn191297/myDb/internal/sql/parser"
@@ -15,7 +16,7 @@ func TestBuildSelectPlan(t *testing.T) {
 		Where:      "id = 1",
 	}
 
-	plan, err := Build(ast, nil) // SELECT doesn't need catalog
+	plan, err := Build(context.Background(), ast, nil) // SELECT doesn't need catalog
 	if err != nil {
 		t.Fatalf("Build SELECT: %v", err)
 	}
@@ -46,7 +47,7 @@ func TestBuildTxnOps(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		plan, err := Build(parser.AST{Type: tt.stmt}, nil) // TXN doesn't need catalog
+		plan, err := Build(context.Background(), parser.AST{Type: tt.stmt}, nil) // TXN doesn't need catalog
 		if err != nil {
 			t.Fatalf("Build(%s): %v", tt.stmt, err)
 		}

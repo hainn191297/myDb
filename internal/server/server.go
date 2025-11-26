@@ -57,8 +57,12 @@ func New(cfg config.Config) (*Server, error) {
 
 // ExecuteSQL implements the gRPC ExecuteSQL method
 func (s *Server) ExecuteSQL(ctx context.Context, req *pb.ExecuteSQLRequest) (*pb.ExecuteSQLResponse, error) {
+	// 0. Initialize Trace
+	ctx, _ = logging.WithTrace(ctx)
+	logging.DebugContext(ctx, "[Server] Starting request execution: %s", req.Sql)
+
 	// 1. Parse SQL
-	ast, err := parser.Parse(req.Sql)
+	ast, err := parser.Parse(ctx, req.Sql)
 	if err != nil {
 		return &pb.ExecuteSQLResponse{
 			Result: &pb.ExecuteSQLResponse_Error{
@@ -71,7 +75,7 @@ func (s *Server) ExecuteSQL(ctx context.Context, req *pb.ExecuteSQLRequest) (*pb
 	}
 
 	// 2. Build plan
-	plan, err := planner.Build(ast, s.catalog)
+	plan, err := planner.Build(ctx, ast, s.catalog)
 	if err != nil {
 		return &pb.ExecuteSQLResponse{
 			Result: &pb.ExecuteSQLResponse_Error{

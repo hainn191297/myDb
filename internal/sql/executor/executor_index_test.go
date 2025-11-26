@@ -21,11 +21,11 @@ func TestExecutorCreateIndex(t *testing.T) {
 
 	// Create Index
 	sql := "CREATE INDEX idx_email ON users (email)"
-	ast, err := parser.Parse(sql)
+	ast, err := parser.Parse(context.Background(), sql)
 	if err != nil {
 		t.Fatalf("Parse CREATE INDEX: %v", err)
 	}
-	plan, err := planner.Build(ast, catalog)
+	plan, err := planner.Build(context.Background(), ast, catalog)
 	if err != nil {
 		t.Fatalf("Build CREATE INDEX: %v", err)
 	}
@@ -79,16 +79,16 @@ func TestExecutorIndexScan(t *testing.T) {
 	// Create Index manually (or via SQL)
 	// Let's use SQL to be sure
 	sql := "CREATE INDEX idx_email ON users (email)"
-	ast, _ := parser.Parse(sql)
-	plan, _ := planner.Build(ast, catalog)
+	ast, _ := parser.Parse(context.Background(), sql)
+	plan, _ := planner.Build(context.Background(), ast, catalog)
 	exec := New(plan, Options{Catalog: catalog, Provider: provider})
 	exec.Next(ctx)
 
 	// Perform Index Scan
 	// SELECT * FROM users WHERE email = 'alice@ex.com'
 	sql = "SELECT * FROM users WHERE email = 'alice@ex.com'"
-	ast, _ = parser.Parse(sql)
-	plan, err := planner.Build(ast, catalog)
+	ast, _ = parser.Parse(context.Background(), sql)
+	plan, err := planner.Build(context.Background(), ast, catalog)
 	if err != nil {
 		t.Fatalf("Build SELECT: %v", err)
 	}
@@ -188,11 +188,11 @@ func TestExecutorIndexMaintenance(t *testing.T) {
 
 // Helper wrapper for DDL execution with provider
 func executeDDLWithProvider(ctx context.Context, catalog *schema.Catalog, provider EngineProvider, sql string) {
-	ast, err := parser.Parse(sql)
+	ast, err := parser.Parse(context.Background(), sql)
 	if err != nil {
 		panic(err)
 	}
-	plan, err := planner.Build(ast, catalog)
+	plan, err := planner.Build(context.Background(), ast, catalog)
 	if err != nil {
 		panic(err)
 	}

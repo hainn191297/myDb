@@ -17,12 +17,12 @@ func TestExecutorCreateTable(t *testing.T) {
 
 	// Parse and plan
 	sql := "CREATE TABLE users (id INT, name TEXT, active BOOL)"
-	ast, err := parser.Parse(sql)
+	ast, err := parser.Parse(context.Background(), sql)
 	if err != nil {
 		t.Fatalf("Parse failed: %v", err)
 	}
 
-	plan, err := planner.Build(ast, catalog)
+	plan, err := planner.Build(context.Background(), ast, catalog)
 	if err != nil {
 		t.Fatalf("Build failed: %v", err)
 	}
@@ -52,8 +52,8 @@ func TestExecutorCreateTableDuplicate(t *testing.T) {
 	catalog := setupTestCatalog(t)
 
 	sql := "CREATE TABLE users (id INT)"
-	ast, _ := parser.Parse(sql)
-	plan, _ := planner.Build(ast, catalog)
+	ast, _ := parser.Parse(context.Background(), sql)
+	plan, _ := planner.Build(context.Background(), ast, catalog)
 
 	// First create should succeed
 	exec := New(plan, Options{Catalog: catalog})
@@ -76,19 +76,19 @@ func TestExecutorDropTable(t *testing.T) {
 
 	// Create table first
 	createSQL := "CREATE TABLE users (id INT)"
-	createAST, _ := parser.Parse(createSQL)
-	createPlan, _ := planner.Build(createAST, catalog)
+	createAST, _ := parser.Parse(context.Background(), createSQL)
+	createPlan, _ := planner.Build(context.Background(), createAST, catalog)
 	exec := New(createPlan, Options{Catalog: catalog})
 	_, _ = exec.Next(ctx)
 
 	// Drop table
 	dropSQL := "DROP TABLE users"
-	dropAST, err := parser.Parse(dropSQL)
+	dropAST, err := parser.Parse(context.Background(), dropSQL)
 	if err != nil {
 		t.Fatalf("Parse DROP failed: %v", err)
 	}
 
-	dropPlan, err := planner.Build(dropAST, catalog)
+	dropPlan, err := planner.Build(context.Background(), dropAST, catalog)
 	if err != nil {
 		t.Fatalf("Build DROP failed: %v", err)
 	}
@@ -147,12 +147,12 @@ func setupTestCatalog(t *testing.T) *schema.Catalog {
 }
 
 func executeDDL(ctx context.Context, catalog *schema.Catalog, sql string) (bool, error) {
-	ast, err := parser.Parse(sql)
+	ast, err := parser.Parse(context.Background(), sql)
 	if err != nil {
 		return false, err
 	}
 
-	plan, err := planner.Build(ast, catalog)
+	plan, err := planner.Build(context.Background(), ast, catalog)
 	if err != nil {
 		return false, err
 	}
