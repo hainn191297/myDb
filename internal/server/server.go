@@ -18,6 +18,8 @@ import (
 	"github.com/hainn191297/myDb/internal/txn"
 
 	pb "github.com/hainn191297/myDb/api/proto"
+
+	_ "net/http/pprof"
 )
 
 // Server implements MyDBService gRPC server

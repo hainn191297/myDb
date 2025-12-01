@@ -22,11 +22,15 @@ func TestParseInsert(t *testing.T) {
 	if spec.Schema != "public" || spec.Table != "users" {
 		t.Errorf("table mismatch: %s.%s", spec.Schema, spec.Table)
 	}
-	if len(spec.Values) != 3 {
-		t.Fatalf("expected 3 values, got %d", len(spec.Values))
+	if len(spec.Values) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(spec.Values))
 	}
-	if spec.Values[0] != "1" || spec.Values[1] != "'alice'" || spec.Values[2] != "true" {
-		t.Errorf("values mismatch: %v", spec.Values)
+	row := spec.Values[0]
+	if len(row) != 3 {
+		t.Fatalf("expected 3 values in row, got %d", len(row))
+	}
+	if row[0] != "1" || row[1] != "'alice'" || row[2] != "true" {
+		t.Errorf("values mismatch: %v", row)
 	}
 }
 

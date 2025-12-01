@@ -74,8 +74,8 @@ type DropIndexSpec struct {
 type InsertSpec struct {
 	Schema  string
 	Table   string
-	Columns []string // Optional: if empty, insert to all columns in order
-	Values  []string // Raw string values from parser
+	Columns []string   // Optional: if empty, insert to all columns in order
+	Values  [][]string // List of rows, each row is a list of raw string values
 }
 
 // UpdateSpec holds UPDATE statement details.
@@ -481,7 +481,7 @@ func parseColumnDef(def string) (ColumnSpec, error) {
 // Supported syntax:
 //
 //	INSERT INTO users VALUES (1, 'alice', true)
-//	INSERT INTO users (id, name) VALUES (1, 'alice')
+//	INSERT INTO users (id, name) VALUES (1, 'alice'), (2, 'bob')
 func parseInsert(ctx context.Context, sql string) (AST, error) {
 	logging.DebugContext(ctx, "[Parser] Parsing INSERT statement")
 
@@ -523,16 +523,59 @@ func parseInsert(ctx context.Context, sql string) (AST, error) {
 		schema, table = splitSchemaTable(tablePart)
 	}
 
-	// Parse VALUES (v1, v2, v3)
-	if !strings.HasPrefix(valuesPart, "(") || !strings.HasSuffix(valuesPart, ")") {
-		return AST{}, fmt.Errorf("parser: INSERT VALUES must be enclosed in parentheses")
+	// Parse VALUES (v1, v2), (v3, v4)
+	var rows [][]string
+	var currentRowStr strings.Builder
+	inParens := false
+	parenDepth := 0
+	inQuotes := false
+	quoteChar := rune(0)
+
+	for _, ch := range valuesPart {
+		if ch == '\'' || ch == '"' {
+			if !inQuotes {
+				inQuotes = true
+				quoteChar = ch
+			} else if ch == quoteChar {
+				inQuotes = false
+			}
+			currentRowStr.WriteRune(ch)
+		} else if ch == '(' && !inQuotes {
+			if parenDepth == 0 {
+				inParens = true
+				currentRowStr.Reset()
+			} else {
+				currentRowStr.WriteRune(ch)
+			}
+			parenDepth++
+		} else if ch == ')' && !inQuotes {
+			parenDepth--
+			if parenDepth == 0 {
+				inParens = false
+				rowValues := parseValues(currentRowStr.String())
+				rows = append(rows, rowValues)
+				currentRowStr.Reset()
+			} else {
+				currentRowStr.WriteRune(ch)
+			}
+		} else if ch == ',' && !inQuotes && !inParens {
+			continue
+		} else {
+			if inParens {
+				currentRowStr.WriteRune(ch)
+			}
+		}
 	}
 
-	valuesInner := strings.TrimSpace(valuesPart[1 : len(valuesPart)-1])
-	values := parseValues(valuesInner)
+	if parenDepth != 0 {
+		return AST{}, fmt.Errorf("parser: unbalanced parentheses in VALUES clause")
+	}
+	if len(rows) == 0 {
+		return AST{}, fmt.Errorf("parser: no values found in INSERT statement")
+	}
 
-	logging.DebugContext(ctx, "[Parser] Successfully parsed INSERT into %s.%s with %d values, %d columns",
-		schema, table, len(values), len(columns))
+	logging.DebugContext(ctx, "[Parser] Successfully parsed INSERT into %s.%s with %d rows, %d columns",
+		schema, table, len(rows), len(columns))
 
 	return AST{
 		Type: InsertStmt,
@@ -540,7 +583,7 @@ func parseInsert(ctx context.Context, sql string) (AST, error) {
 			Schema:  schema,
 			Table:   table,
 			Columns: columns,
-			Values:  values,
+			Values:  rows,
 		},
 	}, nil
 }

@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/chzyer/readline"
 	"google.golang.org/grpc"
@@ -40,11 +41,52 @@ func main() {
 }
 
 func run(serverAddr string) error {
-	// Connect to server
-	conn, err := grpc.Dial(serverAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return fmt.Errorf("failed to connect: %w", err)
+	const (
+		maxRetries        = 3
+		initialBackoff    = 100 * time.Millisecond
+		backoffMultiplier = 2
+	)
+
+	var conn *grpc.ClientConn
+	var err error
+
+	// Retry connection with exponential backoff
+	backoff := initialBackoff
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		// Connect to server
+		conn, err = grpc.NewClient(serverAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			if attempt < maxRetries {
+				time.Sleep(backoff)
+				backoff *= backoffMultiplier
+				continue
+			}
+			return fmt.Errorf("server is down or unreachable at %s after %d attempts: %w", serverAddr, maxRetries, err)
+		}
+
+		// Verify server is actually available by making a ping call
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_, err = pb.NewMyDBServiceClient(conn).GetMetadata(ctx, &pb.GetMetadataRequest{Schema: "public"})
+		cancel()
+
+		if err == nil {
+			// Connection successful
+			break
+		}
+
+		// Connection failed, close and retry
+		conn.Close()
+
+		if attempt < maxRetries {
+			// Silent retry with backoff
+			time.Sleep(backoff)
+			backoff *= backoffMultiplier
+			continue
+		}
+
+		return fmt.Errorf("server at %s is not responding (may be down) after %d attempts: %w", serverAddr, maxRetries, err)
 	}
+
 	defer conn.Close()
 
 	client := &Client{

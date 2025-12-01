@@ -69,8 +69,8 @@ func (d *DropTableOp) Name() string { return "DropTable" }
 type InsertOp struct {
 	Schema  string
 	Table   string
-	Columns []string // Column names (validated against schema)
-	Values  [][]byte // Encoded values (typed according to schema)
+	Columns []string   // Column names (validated against schema)
+	Values  [][][]byte // List of rows, each row is a list of encoded values
 }
 
 func (i *InsertOp) Name() string { return "Insert" }
@@ -349,52 +349,58 @@ func buildInsert(ctx context.Context, ast parser.AST, catalog *schema.Catalog) (
 		}
 	}
 
-	// Validate column count
-	if len(spec.Values) != len(columns) {
-		return Plan{}, fmt.Errorf("planner: INSERT value count (%d) doesn't match column count (%d)",
-			len(spec.Values), len(columns))
-	}
+	// Encode all rows
+	logging.DebugContext(ctx, "[Planner] Encoding %d rows for INSERT", len(spec.Values))
+	var batchEncodedValues [][][]byte
 
-	// Validate columns exist and encode values
-	logging.DebugContext(ctx, "[Planner] Encoding %d values for INSERT", len(columns))
-	encodedValues := make([][]byte, len(columns))
-	for i, colName := range columns {
-		// Find column in table def
-		var colDef *schema.ColumnDef
-		for j := range tableDef.Columns {
-			if tableDef.Columns[j].Name == colName {
-				colDef = &tableDef.Columns[j]
-				break
+	for rowIdx, rowValues := range spec.Values {
+		// Validate column count
+		if len(rowValues) != len(columns) {
+			return Plan{}, fmt.Errorf("planner: INSERT value count (%d) for row %d doesn't match column count (%d)",
+				len(rowValues), rowIdx, len(columns))
+		}
+
+		encodedRow := make([][]byte, len(columns))
+		for i, colName := range columns {
+			// Find column in table def
+			var colDef *schema.ColumnDef
+			for j := range tableDef.Columns {
+				if tableDef.Columns[j].Name == colName {
+					colDef = &tableDef.Columns[j]
+					break
+				}
 			}
-		}
-		if colDef == nil {
-			return Plan{}, fmt.Errorf("planner: column %q not found in table %s.%s",
-				colName, spec.Schema, spec.Table)
-		}
+			if colDef == nil {
+				return Plan{}, fmt.Errorf("planner: column %q not found in table %s.%s",
+					colName, spec.Schema, spec.Table)
+			}
 
-		// Encode value using type system
-		value := spec.Values[i]
-		// Strip quotes from string literals
-		if len(value) >= 2 && (value[0] == '\'' || value[0] == '"') {
-			value = value[1 : len(value)-1]
-		}
+			// Encode value using type system
+			value := rowValues[i]
+			// Strip quotes from string literals
+			if len(value) >= 2 && (value[0] == '\'' || value[0] == '"') {
+				value = value[1 : len(value)-1]
+			}
 
-		encoded, err := colDef.Type.Encode(value)
-		if err != nil {
-			return Plan{}, fmt.Errorf("planner: cannot encode value %q for column %s: %w",
-				spec.Values[i], colName, err)
+			encoded, err := colDef.Type.Encode(value)
+			if err != nil {
+				return Plan{}, fmt.Errorf("planner: cannot encode value %q for column %s: %w",
+					rowValues[i], colName, err)
+			}
+			encodedRow[i] = encoded
 		}
-		encodedValues[i] = encoded
+		batchEncodedValues = append(batchEncodedValues, encodedRow)
 	}
+
 	logging.DebugContext(ctx, "[Planner] Successfully encoded all values")
 
 	op := &InsertOp{
 		Schema:  spec.Schema,
 		Table:   spec.Table,
 		Columns: columns,
-		Values:  encodedValues,
+		Values:  batchEncodedValues,
 	}
-	logging.DebugContext(ctx, "[Planner] Created InsertOp for %s.%s with %d columns", spec.Schema, spec.Table, len(columns))
+	logging.DebugContext(ctx, "[Planner] Created InsertOp for %s.%s with %d rows", spec.Schema, spec.Table, len(batchEncodedValues))
 	return Plan{Root: op}, nil
 }
 

@@ -453,7 +453,7 @@ func (e *Executor) executeDropTable(ctx context.Context, op *planner.DropTableOp
 }
 
 func (e *Executor) executeInsert(ctx context.Context, op *planner.InsertOp) error {
-	logging.DebugContext(ctx, "[Executor] Starting INSERT execution for %s.%s", op.Schema, op.Table)
+	logging.DebugContext(ctx, "[Executor] Starting INSERT execution for %s.%s with %d rows", op.Schema, op.Table, len(op.Values))
 
 	if e.provider == nil {
 		return errors.New("executor: storage provider not configured")
@@ -466,72 +466,67 @@ func (e *Executor) executeInsert(ctx context.Context, op *planner.InsertOp) erro
 	}
 	logging.DebugContext(ctx, "[Executor] Resolved storage engine for %s.%s", op.Schema, op.Table)
 
-	// Encode row: [len1][val1][len2][val2]...
-	var rowData []byte
-	for _, value := range op.Values {
-		// Write length prefix (4 bytes)
-		lenBytes := make([]byte, 4)
-		lenBytes[0] = byte(len(value))
-		lenBytes[1] = byte(len(value) >> 8)
-		lenBytes[2] = byte(len(value) >> 16)
-		lenBytes[3] = byte(len(value) >> 24)
-		rowData = append(rowData, lenBytes...)
-		rowData = append(rowData, value...)
-	}
-
-	// Use first column as key (simple strategy for MVP)
-	// In a real DB, you'd use a primary key or auto-increment
-	key := op.Values[0]
-
-	// Check for duplicate primary key
-	// We only check if it's a primary key insert. For now, we assume the first column is the PK.
-	// In a real implementation, we should check table definition.
-	// But based on current logic, key is always op.Values[0].
-	if _, err := eng.Get(ctx, key); err == nil {
-		logging.WarnContext(ctx, "[Executor] Duplicate primary key detected: %x", key)
-		return fmt.Errorf("executor: duplicate primary key: %v", key)
-	} else if !errors.Is(err, engine.ErrKeyNotFound) {
-		return fmt.Errorf("executor: check duplicate key: %w", err)
-	}
-
-	// Store row
-	if err := eng.Put(ctx, key, rowData); err != nil {
-		return fmt.Errorf("executor: insert into %s.%s: %w", op.Schema, op.Table, err)
-	}
-	logging.DebugContext(ctx, "[Executor] Row inserted into storage engine")
-
-	// Maintain Indexes
+	// Get indexes once
 	indexes, err := e.catalog.GetIndexes(op.Schema, op.Table)
 	if err != nil {
 		return fmt.Errorf("executor: get indexes: %w", err)
 	}
 
-	for _, idx := range indexes {
-		if idx.IsPrimaryKey {
-			continue // HeapEngine handles PK index maintenance
+	// Iterate over all rows in the batch
+	for i, rowValues := range op.Values {
+		// Encode row: [len1][val1][len2][val2]...
+		var rowData []byte
+		for _, value := range rowValues {
+			// Write length prefix (4 bytes)
+			lenBytes := make([]byte, 4)
+			lenBytes[0] = byte(len(value))
+			lenBytes[1] = byte(len(value) >> 8)
+			lenBytes[2] = byte(len(value) >> 16)
+			lenBytes[3] = byte(len(value) >> 24)
+			rowData = append(rowData, lenBytes...)
+			rowData = append(rowData, value...)
 		}
 
-		idxEng, err := e.provider.Index(op.Schema, op.Table, idx.IndexName)
-		if err != nil {
-			return fmt.Errorf("executor: open index %s: %w", idx.IndexName, err)
+		// Use first column as key (simple strategy for MVP)
+		key := rowValues[0]
+
+		// Check for duplicate primary key
+		if _, err := eng.Get(ctx, key); err == nil {
+			logging.WarnContext(ctx, "[Executor] Duplicate primary key detected: %x (row %d)", key, i)
+			return fmt.Errorf("executor: duplicate primary key at row %d: %v", i, key)
+		} else if !errors.Is(err, engine.ErrKeyNotFound) {
+			return fmt.Errorf("executor: check duplicate key at row %d: %w", i, err)
 		}
 
-		// Extract index key
-		// We need to decode the values we just encoded? Or use op.Values (which are encoded).
-		// op.Values corresponds to op.Columns.
-		// We need to map index columns to op.Values.
-
-		// Helper to extract from op.Values based on op.Columns
-		indexKey, err := extractIndexKeyFromOp(op.Values, op.Columns, idx.Columns)
-		if err != nil {
-			return fmt.Errorf("executor: extract key for index %s: %w", idx.IndexName, err)
+		// Store row
+		if err := eng.Put(ctx, key, rowData); err != nil {
+			return fmt.Errorf("executor: insert row %d into %s.%s: %w", i, op.Schema, op.Table, err)
 		}
 
-		if err := idxEng.Insert(indexKey, key); err != nil {
-			return fmt.Errorf("executor: insert into index %s: %w", idx.IndexName, err)
+		// Maintain Indexes
+		for _, idx := range indexes {
+			if idx.IsPrimaryKey {
+				continue // HeapEngine handles PK index maintenance
+			}
+
+			idxEng, err := e.provider.Index(op.Schema, op.Table, idx.IndexName)
+			if err != nil {
+				return fmt.Errorf("executor: open index %s: %w", idx.IndexName, err)
+			}
+
+			// Extract index key from current row values
+			indexKey, err := extractIndexKeyFromOp(rowValues, op.Columns, idx.Columns)
+			if err != nil {
+				return fmt.Errorf("executor: extract key for index %s: %w", idx.IndexName, err)
+			}
+
+			if err := idxEng.Insert(indexKey, key); err != nil {
+				return fmt.Errorf("executor: insert into index %s: %w", idx.IndexName, err)
+			}
 		}
-		logging.DebugContext(ctx, "[Executor] Updated index %s", idx.IndexName)
 	}
+
+	logging.DebugContext(ctx, "[Executor] All %d rows inserted into storage engine", len(op.Values))
 
 	// Flush data to disk for durability
 	if flusher, ok := e.provider.(interface{ FlushAll() error }); ok {
