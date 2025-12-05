@@ -138,6 +138,74 @@ func TestExecutorDDLEndToEnd(t *testing.T) {
 	}
 }
 
+func TestExecutorInsertWithDefaultValue(t *testing.T) {
+	ctx := context.Background()
+	catalog := setupTestCatalog(t)
+	provider := newFakeEngineProvider()
+
+	// Create table with a default value
+	createSQL := "CREATE TABLE users (id INT, name TEXT DEFAULT 'anonymous')"
+	ast, _ := parser.Parse(context.Background(), createSQL)
+	plan, _ := planner.Build(context.Background(), ast, catalog)
+	exec := New(plan, Options{Catalog: catalog, Provider: provider})
+	_, err := exec.Next(ctx)
+	if err != nil {
+		t.Fatalf("CREATE TABLE failed: %v", err)
+	}
+
+	// Insert a row without specifying the name
+	insertSQL := "INSERT INTO users (id) VALUES (1)"
+	ast, _ = parser.Parse(context.Background(), insertSQL)
+	plan, _ = planner.Build(context.Background(), ast, catalog)
+	exec = New(plan, Options{Catalog: catalog, Provider: provider})
+	_, err = exec.Next(ctx)
+	if err != nil {
+		t.Fatalf("INSERT failed: %v", err)
+	}
+
+	// Verify that the default value was inserted
+	eng, _ := provider.Engine("public", "users")
+	val, err := eng.Get(ctx, []byte{1, 0, 0, 0, 0, 0, 0, 0})
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	// Decode the row
+	tableDef, _ := catalog.GetTable("public", "users")
+	values, err := DecodeRow(val, len(tableDef.Columns))
+	if err != nil {
+		t.Fatalf("DecodeRow failed: %v", err)
+	}
+
+	// Check the default value
+	if string(values[1]) != "anonymous" {
+		t.Errorf("expected default value 'anonymous', got %s", string(values[1]))
+	}
+}
+
+type fakeEngineProvider struct {
+	engines map[string]engine.Engine
+}
+
+func newFakeEngineProvider() *fakeEngineProvider {
+	return &fakeEngineProvider{engines: make(map[string]engine.Engine)}
+}
+
+func (p *fakeEngineProvider) Engine(schema, table string) (engine.Engine, error) {
+	key := fmt.Sprintf("%s.%s", schema, table)
+	if eng, ok := p.engines[key]; ok {
+		return eng, nil
+	}
+	eng := newFakeEngineForCatalog()
+	p.engines[key] = eng
+	return eng, nil
+}
+
+func (p *fakeEngineProvider) Index(schema, table, indexName string) (engine.IndexEngine, error) {
+	return nil, fmt.Errorf("not implemented")
+}
+
+
 func setupTestCatalog(t *testing.T) *schema.Catalog {
 	t.Helper()
 	tableEng := newFakeEngineForCatalog()
