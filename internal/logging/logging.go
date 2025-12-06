@@ -3,10 +3,14 @@ package logging
 import (
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"log"
 	"os"
+	"runtime"
+	"strings"
+	"time"
 )
 
 type ctxKey string
@@ -150,7 +154,17 @@ func ctxPrefix(ctx context.Context) string {
 }
 
 func prefix(trace, level, color string) string {
-	out := ""
+	_, file, line, ok := runtime.Caller(2) // capture the real caller
+	caller := ""
+	if ok {
+		short := file
+		if idx := strings.LastIndex(file, "/"); idx >= 0 {
+			short = file[idx+1:]
+		}
+		caller = fmt.Sprintf("%s:%d", short, line)
+	}
+
+	out := utcOffsetString(time.Now()) + " "
 	if colorEnabled {
 		out += color + level + reset + " "
 	} else {
@@ -159,7 +173,19 @@ func prefix(trace, level, color string) string {
 	if trace != "" {
 		out += trace
 	}
-	return out
+	return out + caller + " "
+}
+
+func utcOffsetString(t time.Time) string {
+	_, offsetSeconds := t.Zone()
+	sign := "+"
+	if offsetSeconds < 0 {
+		sign = "-"
+		offsetSeconds = -offsetSeconds
+	}
+	hours := offsetSeconds / 3600
+	minutes := (offsetSeconds % 3600) / 60
+	return fmt.Sprintf("UTC%s%02d:%02d", sign, hours, minutes)
 }
 
 // newTraceID returns a 16-byte (32 hex chars) trace ID matching OpenTelemetry size.
@@ -172,7 +198,9 @@ func randomHex(nBytes int) string {
 	buf := make([]byte, nBytes)
 	if _, err := rand.Read(buf); err != nil {
 		// In the unlikely event of RNG failure, fall back to a predictable but unique-ish value.
-		return fmt.Sprintf("fallback-%d", nBytes)
+		t := time.Now().UnixNano()
+		p := os.Getpid()
+		binary.LittleEndian.PutUint64(buf, uint64(t)^uint64(p))
 	}
 	return hex.EncodeToString(buf)
 }
