@@ -191,7 +191,44 @@ func (e *Executor) nextSeqScan(ctx context.Context, op *planner.SeqScanOp) (bool
 			}
 		}
 
-		// Build a temporary row for filtering
+		// Apply filter using FilterExpr if available, otherwise fall back to string filter
+		if op.FilterExpr != nil {
+			// Construct row with ALL columns for filtering
+			var filterRow Row
+			if e.tableDef != nil && decodedValues != nil {
+				allCols := make([]string, len(e.tableDef.Columns))
+				for i, col := range e.tableDef.Columns {
+					allCols[i] = col.Name
+				}
+				filterRow = Row{Columns: allCols, Values: decodedValues}
+			} else {
+				// Legacy case or no table def - best effort using projected columns
+				// This might fail if filter refers to non-projected columns
+				tempValues := make([][]byte, len(e.rowSpecs))
+				tempCols := make([]string, len(e.rowSpecs))
+				for i, spec := range e.rowSpecs {
+					tempCols[i] = spec.name
+					if spec.kind == columnKey {
+						tempValues[i] = key
+					} else {
+						tempValues[i] = val
+					}
+				}
+				filterRow = Row{Columns: tempCols, Values: tempValues}
+			}
+
+			match, err := evaluateFilter(ctx, op.FilterExpr, filterRow, e.tableDef)
+			if err != nil {
+				return false, fmt.Errorf("executor: evaluate filter: %w", err)
+			}
+			if !match {
+				continue
+			}
+		} else if op.Filter != "" && !e.matchesFilter(op.Schema, op.Table, key, val, op.Filter) {
+			continue
+		}
+
+		// Build the projected row
 		values := make([][]byte, len(e.rowSpecs))
 		cols := make([]string, len(e.rowSpecs))
 		for i, spec := range e.rowSpecs {
@@ -210,20 +247,6 @@ func (e *Executor) nextSeqScan(ctx context.Context, op *planner.SeqScanOp) (bool
 					values[i] = val
 				}
 			}
-		}
-
-		// Apply filter using FilterExpr if available, otherwise fall back to string filter
-		if op.FilterExpr != nil {
-			tempRow := Row{Columns: cols, Values: values}
-			match, err := evaluateFilter(ctx, op.FilterExpr, tempRow, e.tableDef)
-			if err != nil {
-				return false, fmt.Errorf("executor: evaluate filter: %w", err)
-			}
-			if !match {
-				continue
-			}
-		} else if op.Filter != "" && !e.matchesFilter(op.Schema, op.Table, key, val, op.Filter) {
-			continue
 		}
 
 		e.current = Row{Columns: cols, Values: values}
@@ -1119,15 +1142,6 @@ func (e *Executor) nextIndexScan(ctx context.Context, op *planner.IndexScanOp) (
 		// ensure rowSpecs are set up.
 		// Wait, SeqScan sets up rowSpecs. IndexScan needs to do the same.
 
-		// Also check Filter. IndexScan might only filter on the indexed column,
-		// but if there are other conditions, we still need to check them.
-		// The current IndexScanOp has a Filter field.
-		if op.Filter != "" && !e.matchesFilter(op.Schema, op.Table, rowKey, rowData, op.Filter) {
-			// Filter didn't match (e.g. secondary condition).
-			// Loop back to next row instead of recursion (prevents stack overflow)
-			continue
-		}
-
 		// Decode row if needed
 		var decodedValues [][]byte
 		if e.tableDef != nil {
@@ -1140,6 +1154,36 @@ func (e *Executor) nextIndexScan(ctx context.Context, op *planner.IndexScanOp) (
 
 		key := append([]byte(nil), rowKey...)
 		val := append([]byte(nil), rowData...)
+
+		// Apply filter using FilterExpr if available
+		if op.FilterExpr != nil {
+			// Construct row with ALL columns for filtering
+			var filterRow Row
+			if e.tableDef != nil && decodedValues != nil {
+				allCols := make([]string, len(e.tableDef.Columns))
+				for i, col := range e.tableDef.Columns {
+					allCols[i] = col.Name
+				}
+				filterRow = Row{Columns: allCols, Values: decodedValues}
+			} else {
+				// Fallback
+				tempCols := []string{"key", "value"}
+				tempValues := [][]byte{key, val}
+				filterRow = Row{Columns: tempCols, Values: tempValues}
+			}
+
+			match, err := evaluateFilter(ctx, op.FilterExpr, filterRow, e.tableDef)
+			if err != nil {
+				return false, fmt.Errorf("executor: evaluate filter: %w", err)
+			}
+			if !match {
+				continue
+			}
+		} else if op.Filter != "" && !e.matchesFilter(op.Schema, op.Table, rowKey, rowData, op.Filter) {
+			continue
+		}
+
+		// Build projected row
 		values := make([][]byte, len(e.rowSpecs))
 		cols := make([]string, len(e.rowSpecs))
 		for i, spec := range e.rowSpecs {

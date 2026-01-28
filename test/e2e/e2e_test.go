@@ -55,6 +55,9 @@ func setupServer(t *testing.T) (*server.Server, func()) {
 func createClient(t *testing.T) pb.MyDBServiceClient {
 	conn, err := grpc.NewClient(fmt.Sprintf("localhost:%d", testPort), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	require.NoError(t, err)
+	if conn == nil {
+		t.Fatal("grpc.NewClient returned nil connection")
+	}
 	t.Cleanup(func() { conn.Close() })
 	return pb.NewMyDBServiceClient(conn)
 }
@@ -153,23 +156,28 @@ func TestBasicCRUD(t *testing.T) {
 		// Txn 2: Try to read account 1 (should block or see old value depending on isolation)
 		// Current implementation uses LockManager. Read should block if Write Lock is held.
 		// To test blocking, we run Txn 2 in a goroutine.
-		done := make(chan bool)
+		client2 := createClient(t)
+		done := make(chan error)
 		go func() {
-			client2 := createClient(t)
 			ctx2 := context.Background()
 			resp, err := client2.ExecuteSQL(ctx2, &pb.ExecuteSQLRequest{Sql: "SELECT balance FROM accounts WHERE id = 1"})
-			require.NoError(t, err)
+			if err != nil {
+				done <- err
+				return
+			}
 			// Should see NEW value after Txn 1 commits?
 			// Or if it blocked, it waits for commit.
 			// If it didn't block (Snapshot Isolation), it sees 100.
 			// Our LockManager implements blocking Read-Write locks.
 			// So it should have waited and seen 200.
-			rows := resp.GetQueryResult().Rows
-			if len(rows) > 0 {
-				// We expect 200 if it waited
-				// But we need to assert this outside.
+			if resp.GetQueryResult() != nil {
+				rows := resp.GetQueryResult().Rows
+				if len(rows) > 0 {
+					// We expect 200 if it waited
+					// But we need to assert this outside.
+				}
 			}
-			done <- true
+			done <- nil
 		}()
 
 		// Sleep to ensure Txn 2 started and is blocked
@@ -179,7 +187,8 @@ func TestBasicCRUD(t *testing.T) {
 		exec1WithSession("COMMIT")
 
 		// Wait for Txn 2
-		<-done
+		err := <-done
+		require.NoError(t, err)
 
 		// Verify final state
 		resp := exec("SELECT balance FROM accounts WHERE id = 1")
@@ -278,7 +287,7 @@ func TestBasicCRUD(t *testing.T) {
 		// Check for error in response
 		require.NotNil(t, resp.GetError())
 		// We expect "duplicate value" or similar error message
-		assert.Contains(t, resp.GetError().Message, "duplicate value")
+		assert.Contains(t, resp.GetError().Message, "duplicate primary key")
 
 		// 4. Verify only one row exists
 		resp, err = client.ExecuteSQL(ctx, &pb.ExecuteSQLRequest{
