@@ -140,6 +140,17 @@ func (e *Executor) Next(ctx context.Context) (bool, error) {
 	}
 }
 
+// acquireLock is a helper to acquire a row-level lock via the transaction manager.
+func (e *Executor) acquireLock(ctx context.Context, schemaName, table string, key []byte, lockType txn.LockType) error {
+	if e.txnManager == nil || e.sessionTxn == nil || e.sessionTxn.Current == nil {
+		return nil
+	}
+	txnID := e.sessionTxn.Current.ID
+	// Key construction: pass full table identifier and row key string.
+	// Manager will join them as "schema.table.key".
+	return e.txnManager.AcquireLock(ctx, txnID, schemaName+"."+table, string(key), lockType)
+}
+
 func (e *Executor) nextSeqScan(ctx context.Context, op *planner.SeqScanOp) (bool, error) {
 	if e.dataIter == nil {
 		if err := e.initSeqScan(ctx, op); err != nil {
@@ -162,6 +173,12 @@ func (e *Executor) nextSeqScan(ctx context.Context, op *planner.SeqScanOp) (bool
 		}
 
 		key := append([]byte(nil), e.dataIter.Key()...)
+
+		// LOCKING: Acquire Read Lock on the row
+		if err := e.acquireLock(ctx, op.Schema, op.Table, key, txn.ReadLock); err != nil {
+			return false, fmt.Errorf("executor: acquire read lock: %w", err)
+		}
+
 		val := append([]byte(nil), e.dataIter.Value()...)
 
 		// Decode row if needed
@@ -490,6 +507,11 @@ func (e *Executor) executeInsert(ctx context.Context, op *planner.InsertOp) erro
 		// Use first column as key (simple strategy for MVP)
 		key := rowValues[0]
 
+		// LOCKING: Acquire Write Lock on the row key
+		if err := e.acquireLock(ctx, op.Schema, op.Table, key, txn.WriteLock); err != nil {
+			return fmt.Errorf("executor: acquire write lock for row %d: %w", i, err)
+		}
+
 		// Check for duplicate primary key
 		if _, err := eng.Get(ctx, key); err == nil {
 			logging.WarnContext(ctx, "[Executor] Duplicate primary key detected: %x (row %d)", key, i)
@@ -574,6 +596,19 @@ func (e *Executor) executeUpdate(ctx context.Context, op *planner.UpdateOp) erro
 	// Update matching rows
 	for iter.Next() {
 		key := iter.Key()
+
+		// LOCKING: Acquire Write Lock on key
+		// NOTE: Strictly speaking, we should acquire ReadLock for Scan, then upgrade to WriteLock if matches.
+		// But Scan returns keys, so we can just grab WriteLock.
+		// If we want to be more concurrency friendly, we check match first, but match requires reading value.
+		// So: Read Value -> Check Match -> Acquire Write -> Put.
+		// But reading value without lock is unsafe (dirty read).
+		// So: Acquire Read (implied by 2PL during scan?) -> Read Value -> Check -> Upgrade to Write.
+		// Since we iterate sequentially, acquiring Write lock here is safe and correct (Pessimistic).
+		if err := e.acquireLock(ctx, op.Schema, op.Table, key, txn.WriteLock); err != nil {
+			return fmt.Errorf("executor: acquire lock for update: %w", err)
+		}
+
 		rowData := iter.Value()
 
 		// Decode row
@@ -714,6 +749,12 @@ func (e *Executor) executeDelete(ctx context.Context, op *planner.DeleteOp) erro
 	var keysToDelete [][]byte
 	for iter.Next() {
 		key := iter.Key()
+
+		// LOCKING: Acquire Write Lock
+		if err := e.acquireLock(ctx, op.Schema, op.Table, key, txn.WriteLock); err != nil {
+			return fmt.Errorf("executor: acquire lock for delete: %w", err)
+		}
+
 		rowData := iter.Value()
 
 		// Evaluate filter using FilterExpr if available
@@ -1066,6 +1107,11 @@ func (e *Executor) nextIndexScan(ctx context.Context, op *planner.IndexScanOp) (
 
 		if err != nil {
 			return false, fmt.Errorf("executor: fetch row from heap: %w", err)
+		}
+
+		// LOCKING: Acquire Read Lock on the row
+		if err := e.acquireLock(ctx, op.Schema, op.Table, rowKey, txn.ReadLock); err != nil {
+			return false, fmt.Errorf("executor: acquire read lock: %w", err)
 		}
 
 		// We have the row data, now project it.
