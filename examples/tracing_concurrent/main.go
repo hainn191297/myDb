@@ -34,7 +34,7 @@ func processQuery(ctx context.Context, queryID int, query string) {
 }
 
 func main() {
-	fmt.Println("=== Advanced Tracing Example: Multiple Concurrent Requests ===\n")
+	fmt.Println("=== Advanced Tracing Example: Multiple Concurrent Requests ===")
 
 	queries := []string{
 		"SELECT * FROM users WHERE id = 1",
@@ -44,7 +44,7 @@ func main() {
 
 	var wg sync.WaitGroup
 
-	fmt.Println("Starting 3 concurrent queries...\n")
+	fmt.Println("Starting 3 concurrent queries...")
 
 	for i, query := range queries {
 		wg.Add(1)
