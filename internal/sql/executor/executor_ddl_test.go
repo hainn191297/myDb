@@ -2,7 +2,6 @@ package executor
 
 import (
 	"context"
-	"fmt"
 	"testing"
 
 	"github.com/hainn191297/myDb/internal/schema"
@@ -174,7 +173,7 @@ func (f *fakeEngineForCatalog) Get(ctx context.Context, key []byte) ([]byte, err
 	if val, ok := f.data[string(key)]; ok {
 		return val, nil
 	}
-	return nil, fmt.Errorf("key not found")
+	return nil, engine.ErrKeyNotFound
 }
 
 func (f *fakeEngineForCatalog) Put(ctx context.Context, key, value []byte) error {

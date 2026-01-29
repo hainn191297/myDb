@@ -565,6 +565,17 @@ func (e *Executor) executeInsert(ctx context.Context, op *planner.InsertOp) erro
 				return fmt.Errorf("executor: extract key for index %s: %w", idx.IndexName, err)
 			}
 
+			// Check uniqueness if required
+			if idx.Unique {
+				_, found, err := idxEng.Search(indexKey)
+				if err != nil {
+					return fmt.Errorf("executor: check unique index %s: %w", idx.IndexName, err)
+				}
+				if found {
+					return fmt.Errorf("duplicate value for unique index %s", idx.IndexName)
+				}
+			}
+
 			if err := idxEng.Insert(indexKey, key); err != nil {
 				return fmt.Errorf("executor: insert into index %s: %w", idx.IndexName, err)
 			}
@@ -718,6 +729,18 @@ func (e *Executor) executeUpdate(ctx context.Context, op *planner.UpdateOp) erro
 				if err := idxEng.Delete(oldKey); err != nil {
 					// Ignore key not found?
 				}
+
+				// Check uniqueness if required
+				if idx.Unique {
+					_, found, err := idxEng.Search(newKey)
+					if err != nil {
+						return fmt.Errorf("executor: check unique index %s: %w", idx.IndexName, err)
+					}
+					if found {
+						return fmt.Errorf("duplicate value for unique index %s", idx.IndexName)
+					}
+				}
+
 				if err := idxEng.Insert(newKey, key); err != nil {
 					return fmt.Errorf("executor: update index %s: %w", idx.IndexName, err)
 				}
