@@ -2,6 +2,12 @@
 
 This repository prototypes a Go-based relational database, so every change should keep the learning-oriented codebase approachable, well-tested, and easy to trace from SQL entrypoints down to storage internals.
 
+## Agent Context Format
+
+- Read `.agent/README.md`, `.agent/project.md`, and `.agent/workflow.md` for the model-agnostic project context.
+- Treat `.agent` as the stable cross-project agent format.
+- Treat `.kiro` as an optional spec-driven workflow for this project, not as the only agent format.
+
 ## Project Structure & Module Organization
 
 - `cmd/mydbd` hosts the primary daemon/CLI wiring that bootstraps configuration, server endpoints, and telemetry.
@@ -29,6 +35,14 @@ This repository prototypes a Go-based relational database, so every change shoul
 - Use Go's `testing` package with table-driven tests (`TestComponentScenario`) colocated with the code under test.
 - Cover all new branches, especially WAL recovery, planner rewrites, and lock arbitration; add regression cases before bugfixes.
 - For concurrency-sensitive code, add `t.Parallel()` only when data races are impossible, and lean on `-race` locally when touching shared state.
+
+## AI-DLC Heavy Thinking Protocol
+
+- For complex or high-risk work, use `.kiro/AI-DLC-HEAVYSKILL.md` before editing code or running implementation commands.
+- Resolve the problem first: define the issue, affected architecture layers, invariants, candidate approaches, selected plan, and validation path.
+- Use independent reasoning tracks for architecture, correctness, implementation, and testing when the task touches multiple packages or core database semantics.
+- Synthesize critically instead of following a majority or first plausible approach; if the reasoning does not converge, return to the relevant `.kiro/specs/{feature}/` documents before acting.
+- Keep final user-facing reports concise: selected approach, files changed, tests run, and remaining risk.
 
 ## Commit & Pull Request Guidelines
 

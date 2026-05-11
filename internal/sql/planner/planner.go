@@ -16,21 +16,53 @@ type Plan struct {
 	Root Operator
 }
 
-// Operator is the core interface implemented by executors.
+// Operator is the core interface implemented by all plan nodes.
+// It defines the contract for physical execution operators.
 type Operator interface {
+	// Name returns the operator type name (e.g., "SeqScan", "Filter", "Join").
 	Name() string
+
+	// EstimatedCost returns the estimated execution cost for this operator.
+	// The cost includes I/O and CPU components.
+	EstimatedCost() Cost
+
+	// EstimatedRows returns the estimated number of rows produced by this operator.
+	// Must be >= 1 and <= source table row count.
+	EstimatedRows() int64
+
+	// OutputColumns returns the names of columns produced by this operator.
+	// Used for tracking column lineage through the plan tree.
+	OutputColumns() []string
 }
 
-// SeqScanOp is a placeholder physical operator for table scans.
+// SeqScanOp is a physical operator for sequential table scans.
+// It reads all rows from a table, optionally applying a filter.
 type SeqScanOp struct {
-	Schema     string
-	Table      string
-	Columns    []string
-	Filter     string    // Deprecated
-	FilterExpr expr.Expr // Structured filter
+	Schema          string
+	Table           string
+	Columns         []string
+	Filter          string    // Deprecated
+	FilterExpr      expr.Expr // Structured filter
+	Cost_           Cost
+	EstimatedRowCnt int64
 }
 
 func (s *SeqScanOp) Name() string { return "SeqScan" }
+
+func (s *SeqScanOp) EstimatedCost() Cost {
+	return s.Cost_
+}
+
+func (s *SeqScanOp) EstimatedRows() int64 {
+	return s.EstimatedRowCnt
+}
+
+func (s *SeqScanOp) OutputColumns() []string {
+	if len(s.Columns) == 0 {
+		return []string{"*"}
+	}
+	return s.Columns
+}
 
 // TxnAction enumerates transaction control operations.
 type TxnAction string
@@ -48,6 +80,18 @@ type TxnOp struct {
 
 func (t *TxnOp) Name() string { return string(t.Action) }
 
+func (t *TxnOp) EstimatedCost() Cost {
+	return Cost{IOCost: 0, CPUCost: 0, TotalCost: 0}
+}
+
+func (t *TxnOp) EstimatedRows() int64 {
+	return 0
+}
+
+func (t *TxnOp) OutputColumns() []string {
+	return []string{}
+}
+
 // CreateTableOp represents CREATE TABLE execution.
 type CreateTableOp struct {
 	Schema  string
@@ -57,6 +101,18 @@ type CreateTableOp struct {
 
 func (c *CreateTableOp) Name() string { return "CreateTable" }
 
+func (c *CreateTableOp) EstimatedCost() Cost {
+	return Cost{IOCost: 0, CPUCost: 0, TotalCost: 0}
+}
+
+func (c *CreateTableOp) EstimatedRows() int64 {
+	return 0
+}
+
+func (c *CreateTableOp) OutputColumns() []string {
+	return []string{}
+}
+
 // DropTableOp represents DROP TABLE execution.
 type DropTableOp struct {
 	Schema string
@@ -65,70 +121,169 @@ type DropTableOp struct {
 
 func (d *DropTableOp) Name() string { return "DropTable" }
 
+func (d *DropTableOp) EstimatedCost() Cost {
+	return Cost{IOCost: 0, CPUCost: 0, TotalCost: 0}
+}
+
+func (d *DropTableOp) EstimatedRows() int64 {
+	return 0
+}
+
+func (d *DropTableOp) OutputColumns() []string {
+	return []string{}
+}
+
 // InsertOp represents INSERT execution.
 type InsertOp struct {
-	Schema  string
-	Table   string
-	Columns []string   // Column names (validated against schema)
-	Values  [][][]byte // List of rows, each row is a list of encoded values
+	Schema          string
+	Table           string
+	Columns         []string   // Column names (validated against schema)
+	Values          [][][]byte // List of rows, each row is a list of encoded values
+	Cost_           Cost
+	EstimatedRowCnt int64
 }
 
 func (i *InsertOp) Name() string { return "Insert" }
 
+func (i *InsertOp) EstimatedCost() Cost {
+	return i.Cost_
+}
+
+func (i *InsertOp) EstimatedRows() int64 {
+	return i.EstimatedRowCnt
+}
+
+func (i *InsertOp) OutputColumns() []string {
+	return []string{}
+}
+
 // UpdateOp represents UPDATE execution.
 type UpdateOp struct {
-	Schema     string
-	Table      string
-	SetClauses map[string][]byte // column -> encoded value
-	Filter     string            // WHERE clause (string for MVP)
-	FilterExpr expr.Expr         // Structured filter
+	Schema          string
+	Table           string
+	SetClauses      map[string][]byte // column -> encoded value
+	Filter          string            // WHERE clause (string for MVP)
+	FilterExpr      expr.Expr         // Structured filter
+	Cost_           Cost
+	EstimatedRowCnt int64
 }
 
 func (u *UpdateOp) Name() string { return "Update" }
 
+func (u *UpdateOp) EstimatedCost() Cost {
+	return u.Cost_
+}
+
+func (u *UpdateOp) EstimatedRows() int64 {
+	return u.EstimatedRowCnt
+}
+
+func (u *UpdateOp) OutputColumns() []string {
+	return []string{}
+}
+
 // DeleteOp represents DELETE execution.
 type DeleteOp struct {
-	Schema     string
-	Table      string
-	Filter     string    // WHERE clause
-	FilterExpr expr.Expr // Structured filter
+	Schema          string
+	Table           string
+	Filter          string    // WHERE clause
+	FilterExpr      expr.Expr // Structured filter
+	Cost_           Cost
+	EstimatedRowCnt int64
 }
 
 func (de *DeleteOp) Name() string { return "Delete" }
 
+func (de *DeleteOp) EstimatedCost() Cost {
+	return de.Cost_
+}
+
+func (de *DeleteOp) EstimatedRows() int64 {
+	return de.EstimatedRowCnt
+}
+
+func (de *DeleteOp) OutputColumns() []string {
+	return []string{}
+}
+
 // CreateIndexOp represents CREATE INDEX execution.
 type CreateIndexOp struct {
-	Schema    string
-	Table     string
-	IndexName string
-	Columns   []string
-	Unique    bool
+	Schema          string
+	Table           string
+	IndexName       string
+	Columns         []string
+	Unique          bool
+	Cost_           Cost
+	EstimatedRowCnt int64
 }
 
 func (c *CreateIndexOp) Name() string { return "CreateIndex" }
 
+func (c *CreateIndexOp) EstimatedCost() Cost {
+	return c.Cost_
+}
+
+func (c *CreateIndexOp) EstimatedRows() int64 {
+	return c.EstimatedRowCnt
+}
+
+func (c *CreateIndexOp) OutputColumns() []string {
+	return []string{}
+}
+
 // DropIndexOp represents DROP INDEX execution.
 type DropIndexOp struct {
-	Schema    string
-	Table     string
-	IndexName string
+	Schema          string
+	Table           string
+	IndexName       string
+	Cost_           Cost
+	EstimatedRowCnt int64
 }
 
 func (d *DropIndexOp) Name() string { return "DropIndex" }
 
+func (d *DropIndexOp) EstimatedCost() Cost {
+	return d.Cost_
+}
+
+func (d *DropIndexOp) EstimatedRows() int64 {
+	return d.EstimatedRowCnt
+}
+
+func (d *DropIndexOp) OutputColumns() []string {
+	return []string{}
+}
+
 // IndexScanOp represents an index-based table scan.
 type IndexScanOp struct {
-	Schema     string
-	Table      string
-	IndexName  string
-	Columns    []string
-	Filter     string
-	FilterExpr expr.Expr
-	StartKey   []byte // For range scans (future)
-	EndKey     []byte // For range scans (future)
+	Schema          string
+	Table           string
+	IndexName       string
+	Columns         []string
+	Filter          string
+	FilterExpr      expr.Expr
+	StartKey        []byte // For range scans (future)
+	EndKey          []byte // For range scans (future)
+	Cost_           Cost
+	EstimatedRowCnt int64
 }
 
 func (i *IndexScanOp) Name() string { return "IndexScan" }
+
+func (i *IndexScanOp) EstimatedCost() Cost {
+	return i.Cost_
+}
+
+func (i *IndexScanOp) EstimatedRows() int64 {
+	return i.EstimatedRowCnt
+}
+
+func (i *IndexScanOp) OutputColumns() []string {
+	if len(i.Columns) == 0 {
+		return []string{"*"}
+	}
+	return i.Columns
+}
 
 // Build transforms the parser AST into an executable plan.
 // The catalog is required for DML statements to validate schemas and encode values.
