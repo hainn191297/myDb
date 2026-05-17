@@ -128,10 +128,8 @@ func (p *Provider) LoadCatalog(ctx context.Context) (*schema.Catalog, error) {
 	// Set catalog in provider so engines can access schema (needed for PK index)
 	p.SetCatalog(cat)
 
-	// Rebuild in-memory indexes from data
-	if err := p.RebuildIndexes(ctx, cat); err != nil {
-		return nil, fmt.Errorf("provider: rebuild indexes: %w", err)
-	}
+	// Note: Indexes are persistent via BTree engine, so no need to rebuild from heap on startup.
+	// RebuildIndexes(ctx, cat)
 
 	return cat, nil
 }

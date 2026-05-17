@@ -140,6 +140,17 @@ func (e *Executor) Next(ctx context.Context) (bool, error) {
 	}
 }
 
+// acquireLock is a helper to acquire a row-level lock via the transaction manager.
+func (e *Executor) acquireLock(ctx context.Context, schemaName, table string, key []byte, lockType txn.LockType) error {
+	if e.txnManager == nil || e.sessionTxn == nil || e.sessionTxn.Current == nil {
+		return nil
+	}
+	txnID := e.sessionTxn.Current.ID
+	// Key construction: pass full table identifier and row key string.
+	// Manager will join them as "schema.table.key".
+	return e.txnManager.AcquireLock(ctx, txnID, schemaName+"."+table, string(key), lockType)
+}
+
 func (e *Executor) nextSeqScan(ctx context.Context, op *planner.SeqScanOp) (bool, error) {
 	if e.dataIter == nil {
 		if err := e.initSeqScan(ctx, op); err != nil {
@@ -162,6 +173,12 @@ func (e *Executor) nextSeqScan(ctx context.Context, op *planner.SeqScanOp) (bool
 		}
 
 		key := append([]byte(nil), e.dataIter.Key()...)
+
+		// LOCKING: Acquire Read Lock on the row
+		if err := e.acquireLock(ctx, op.Schema, op.Table, key, txn.ReadLock); err != nil {
+			return false, fmt.Errorf("executor: acquire read lock: %w", err)
+		}
+
 		val := append([]byte(nil), e.dataIter.Value()...)
 
 		// Decode row if needed
@@ -174,7 +191,44 @@ func (e *Executor) nextSeqScan(ctx context.Context, op *planner.SeqScanOp) (bool
 			}
 		}
 
-		// Build a temporary row for filtering
+		// Apply filter using FilterExpr if available, otherwise fall back to string filter
+		if op.FilterExpr != nil {
+			// Construct row with ALL columns for filtering
+			var filterRow Row
+			if e.tableDef != nil && decodedValues != nil {
+				allCols := make([]string, len(e.tableDef.Columns))
+				for i, col := range e.tableDef.Columns {
+					allCols[i] = col.Name
+				}
+				filterRow = Row{Columns: allCols, Values: decodedValues}
+			} else {
+				// Legacy case or no table def - best effort using projected columns
+				// This might fail if filter refers to non-projected columns
+				tempValues := make([][]byte, len(e.rowSpecs))
+				tempCols := make([]string, len(e.rowSpecs))
+				for i, spec := range e.rowSpecs {
+					tempCols[i] = spec.name
+					if spec.kind == columnKey {
+						tempValues[i] = key
+					} else {
+						tempValues[i] = val
+					}
+				}
+				filterRow = Row{Columns: tempCols, Values: tempValues}
+			}
+
+			match, err := evaluateFilter(ctx, op.FilterExpr, filterRow, e.tableDef)
+			if err != nil {
+				return false, fmt.Errorf("executor: evaluate filter: %w", err)
+			}
+			if !match {
+				continue
+			}
+		} else if op.Filter != "" && !e.matchesFilter(op.Schema, op.Table, key, val, op.Filter) {
+			continue
+		}
+
+		// Build the projected row
 		values := make([][]byte, len(e.rowSpecs))
 		cols := make([]string, len(e.rowSpecs))
 		for i, spec := range e.rowSpecs {
@@ -193,20 +247,6 @@ func (e *Executor) nextSeqScan(ctx context.Context, op *planner.SeqScanOp) (bool
 					values[i] = val
 				}
 			}
-		}
-
-		// Apply filter using FilterExpr if available, otherwise fall back to string filter
-		if op.FilterExpr != nil {
-			tempRow := Row{Columns: cols, Values: values}
-			match, err := evaluateFilter(ctx, op.FilterExpr, tempRow, e.tableDef)
-			if err != nil {
-				return false, fmt.Errorf("executor: evaluate filter: %w", err)
-			}
-			if !match {
-				continue
-			}
-		} else if op.Filter != "" && !e.matchesFilter(op.Schema, op.Table, key, val, op.Filter) {
-			continue
 		}
 
 		e.current = Row{Columns: cols, Values: values}
@@ -490,6 +530,11 @@ func (e *Executor) executeInsert(ctx context.Context, op *planner.InsertOp) erro
 		// Use first column as key (simple strategy for MVP)
 		key := rowValues[0]
 
+		// LOCKING: Acquire Write Lock on the row key
+		if err := e.acquireLock(ctx, op.Schema, op.Table, key, txn.WriteLock); err != nil {
+			return fmt.Errorf("executor: acquire write lock for row %d: %w", i, err)
+		}
+
 		// Check for duplicate primary key
 		if _, err := eng.Get(ctx, key); err == nil {
 			logging.WarnContext(ctx, "[Executor] Duplicate primary key detected: %x (row %d)", key, i)
@@ -518,6 +563,17 @@ func (e *Executor) executeInsert(ctx context.Context, op *planner.InsertOp) erro
 			indexKey, err := extractIndexKeyFromOp(rowValues, op.Columns, idx.Columns)
 			if err != nil {
 				return fmt.Errorf("executor: extract key for index %s: %w", idx.IndexName, err)
+			}
+
+			// Check uniqueness if required
+			if idx.Unique {
+				_, found, err := idxEng.Search(indexKey)
+				if err != nil {
+					return fmt.Errorf("executor: check unique index %s: %w", idx.IndexName, err)
+				}
+				if found {
+					return fmt.Errorf("duplicate value for unique index %s", idx.IndexName)
+				}
 			}
 
 			if err := idxEng.Insert(indexKey, key); err != nil {
@@ -574,6 +630,19 @@ func (e *Executor) executeUpdate(ctx context.Context, op *planner.UpdateOp) erro
 	// Update matching rows
 	for iter.Next() {
 		key := iter.Key()
+
+		// LOCKING: Acquire Write Lock on key
+		// NOTE: Strictly speaking, we should acquire ReadLock for Scan, then upgrade to WriteLock if matches.
+		// But Scan returns keys, so we can just grab WriteLock.
+		// If we want to be more concurrency friendly, we check match first, but match requires reading value.
+		// So: Read Value -> Check Match -> Acquire Write -> Put.
+		// But reading value without lock is unsafe (dirty read).
+		// So: Acquire Read (implied by 2PL during scan?) -> Read Value -> Check -> Upgrade to Write.
+		// Since we iterate sequentially, acquiring Write lock here is safe and correct (Pessimistic).
+		if err := e.acquireLock(ctx, op.Schema, op.Table, key, txn.WriteLock); err != nil {
+			return fmt.Errorf("executor: acquire lock for update: %w", err)
+		}
+
 		rowData := iter.Value()
 
 		// Decode row
@@ -660,6 +729,18 @@ func (e *Executor) executeUpdate(ctx context.Context, op *planner.UpdateOp) erro
 				if err := idxEng.Delete(oldKey); err != nil {
 					// Ignore key not found?
 				}
+
+				// Check uniqueness if required
+				if idx.Unique {
+					_, found, err := idxEng.Search(newKey)
+					if err != nil {
+						return fmt.Errorf("executor: check unique index %s: %w", idx.IndexName, err)
+					}
+					if found {
+						return fmt.Errorf("duplicate value for unique index %s", idx.IndexName)
+					}
+				}
+
 				if err := idxEng.Insert(newKey, key); err != nil {
 					return fmt.Errorf("executor: update index %s: %w", idx.IndexName, err)
 				}
@@ -714,6 +795,12 @@ func (e *Executor) executeDelete(ctx context.Context, op *planner.DeleteOp) erro
 	var keysToDelete [][]byte
 	for iter.Next() {
 		key := iter.Key()
+
+		// LOCKING: Acquire Write Lock
+		if err := e.acquireLock(ctx, op.Schema, op.Table, key, txn.WriteLock); err != nil {
+			return fmt.Errorf("executor: acquire lock for delete: %w", err)
+		}
+
 		rowData := iter.Value()
 
 		// Evaluate filter using FilterExpr if available
@@ -1068,19 +1155,15 @@ func (e *Executor) nextIndexScan(ctx context.Context, op *planner.IndexScanOp) (
 			return false, fmt.Errorf("executor: fetch row from heap: %w", err)
 		}
 
+		// LOCKING: Acquire Read Lock on the row
+		if err := e.acquireLock(ctx, op.Schema, op.Table, rowKey, txn.ReadLock); err != nil {
+			return false, fmt.Errorf("executor: acquire read lock: %w", err)
+		}
+
 		// We have the row data, now project it.
 		// Note: We are reusing the same projection logic as SeqScan, but we need to
 		// ensure rowSpecs are set up.
 		// Wait, SeqScan sets up rowSpecs. IndexScan needs to do the same.
-
-		// Also check Filter. IndexScan might only filter on the indexed column,
-		// but if there are other conditions, we still need to check them.
-		// The current IndexScanOp has a Filter field.
-		if op.Filter != "" && !e.matchesFilter(op.Schema, op.Table, rowKey, rowData, op.Filter) {
-			// Filter didn't match (e.g. secondary condition).
-			// Loop back to next row instead of recursion (prevents stack overflow)
-			continue
-		}
 
 		// Decode row if needed
 		var decodedValues [][]byte
@@ -1094,6 +1177,36 @@ func (e *Executor) nextIndexScan(ctx context.Context, op *planner.IndexScanOp) (
 
 		key := append([]byte(nil), rowKey...)
 		val := append([]byte(nil), rowData...)
+
+		// Apply filter using FilterExpr if available
+		if op.FilterExpr != nil {
+			// Construct row with ALL columns for filtering
+			var filterRow Row
+			if e.tableDef != nil && decodedValues != nil {
+				allCols := make([]string, len(e.tableDef.Columns))
+				for i, col := range e.tableDef.Columns {
+					allCols[i] = col.Name
+				}
+				filterRow = Row{Columns: allCols, Values: decodedValues}
+			} else {
+				// Fallback
+				tempCols := []string{"key", "value"}
+				tempValues := [][]byte{key, val}
+				filterRow = Row{Columns: tempCols, Values: tempValues}
+			}
+
+			match, err := evaluateFilter(ctx, op.FilterExpr, filterRow, e.tableDef)
+			if err != nil {
+				return false, fmt.Errorf("executor: evaluate filter: %w", err)
+			}
+			if !match {
+				continue
+			}
+		} else if op.Filter != "" && !e.matchesFilter(op.Schema, op.Table, rowKey, rowData, op.Filter) {
+			continue
+		}
+
+		// Build projected row
 		values := make([][]byte, len(e.rowSpecs))
 		cols := make([]string, len(e.rowSpecs))
 		for i, spec := range e.rowSpecs {

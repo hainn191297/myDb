@@ -19,8 +19,9 @@ const (
 
 // LockManager manages row-level locks.
 type LockManager struct {
-	mu    sync.Mutex
-	locks map[string]*lock // key -> lock
+	mu       sync.Mutex
+	locks    map[string]*lock      // key -> lock
+	txnLocks map[uint64][]string   // txnID -> [keys...]
 }
 
 type lock struct {
@@ -44,7 +45,8 @@ func newLock() *lock {
 
 func NewLockManager() *LockManager {
 	return &LockManager{
-		locks: make(map[string]*lock),
+		locks:    make(map[string]*lock),
+		txnLocks: make(map[uint64][]string),
 	}
 }
 
@@ -61,10 +63,23 @@ func (lm *LockManager) Acquire(ctx context.Context, txnID uint64, key string, lT
 
 	l.mu.Lock()
 
+	// Check if we already hold the lock (re-entry or upgrade)
+	alreadyHeld := false
+	if _, ok := l.holders[txnID]; ok {
+		alreadyHeld = true
+	}
+
 	// Check if we can acquire immediately
 	if lm.canAcquire(l, txnID, lType) {
 		l.holders[txnID] = lType
 		l.mu.Unlock()
+
+		if !alreadyHeld {
+			lm.mu.Lock()
+			lm.txnLocks[txnID] = append(lm.txnLocks[txnID], key)
+			lm.mu.Unlock()
+		}
+
 		logging.Debugf("txn %d acquired lock %s immediately", txnID, key)
 		return nil
 	}
@@ -83,6 +98,7 @@ func (lm *LockManager) Acquire(ctx context.Context, txnID uint64, key string, lT
 	select {
 	case <-w.ready:
 		logging.Debugf("txn %d acquired lock %s after wait", txnID, key)
+		// NOTE: The waker (Release) has already added us to txnLocks and set holders.
 		return nil
 	case <-ctx.Done():
 		logging.Debugf("txn %d context done while waiting for lock %s", txnID, key)
@@ -136,7 +152,17 @@ func (lm *LockManager) Release(txnID uint64) {
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
 
-	for key, l := range lm.locks {
+	keys, ok := lm.txnLocks[txnID]
+	if !ok {
+		return
+	}
+
+	for _, key := range keys {
+		l, exists := lm.locks[key]
+		if !exists {
+			continue
+		}
+
 		l.mu.Lock()
 		if _, ok := l.holders[txnID]; ok {
 			delete(l.holders, txnID)
@@ -155,6 +181,11 @@ func (lm *LockManager) Release(txnID uint64) {
 				for _, w := range l.waiters {
 					if lm.canAcquire(l, w.txnID, w.lType) {
 						l.holders[w.txnID] = w.lType
+
+						// Add to txnLocks for the woken transaction
+						// We hold lm.mu, so this is safe.
+						lm.txnLocks[w.txnID] = append(lm.txnLocks[w.txnID], key)
+
 						close(w.ready)
 					} else {
 						activeWaiters = append(activeWaiters, w)
@@ -170,6 +201,8 @@ func (lm *LockManager) Release(txnID uint64) {
 		}
 		l.mu.Unlock()
 	}
+
+	delete(lm.txnLocks, txnID)
 }
 
 // Manager coordinates transaction lifecycle and hooks log/recovery.
