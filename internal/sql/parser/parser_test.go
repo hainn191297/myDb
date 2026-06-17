@@ -133,6 +133,18 @@ func TestParseCreateTableNotNull(t *testing.T) {
 	}
 }
 
+func TestParseCreateTableWithDefaultValue(t *testing.T) {
+	sql := "CREATE TABLE users (id INT, name TEXT DEFAULT 'anonymous')"
+	ast, err := Parse(context.Background(), sql)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	if ast.CreateTable.Columns[1].DefaultValue != "'anonymous'" {
+		t.Errorf("expected default value 'anonymous', got %s", ast.CreateTable.Columns[1].DefaultValue)
+	}
+}
+
 func TestParseCreateTableErrors(t *testing.T) {
 	tests := []string{
 		"CREATE TABLE",               // Missing table name

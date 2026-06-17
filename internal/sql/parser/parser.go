@@ -42,10 +42,11 @@ type CreateTableSpec struct {
 
 // ColumnSpec represents a column definition in CREATE TABLE.
 type ColumnSpec struct {
-	Name       string
-	Type       string // "INT", "TEXT", "BOOL", "FLOAT"
-	Nullable   bool
-	PrimaryKey bool
+	Name         string
+	Type         string // "INT", "TEXT", "BOOL", "FLOAT"
+	Nullable     bool
+	PrimaryKey   bool
+	DefaultValue string
 }
 
 // DropTableSpec holds DROP TABLE statement details.
@@ -456,6 +457,7 @@ func parseColumnDef(def string) (ColumnSpec, error) {
 	// Default to nullable, check for NOT NULL and PRIMARY KEY
 	nullable := true
 	primaryKey := false
+	var defaultValue string
 
 	for i := 2; i < len(tokens); i++ {
 		token := strings.ToUpper(tokens[i])
@@ -466,14 +468,18 @@ func parseColumnDef(def string) (ColumnSpec, error) {
 			primaryKey = true
 			nullable = false // PRIMARY KEY implies NOT NULL
 			i++              // Skip KEY
+		} else if token == "DEFAULT" && i+1 < len(tokens) {
+			defaultValue = tokens[i+1]
+			i++ // Skip value
 		}
 	}
 
 	return ColumnSpec{
-		Name:       name,
-		Type:       typeName,
-		Nullable:   nullable,
-		PrimaryKey: primaryKey,
+		Name:         name,
+		Type:         typeName,
+		Nullable:     nullable,
+		PrimaryKey:   primaryKey,
+		DefaultValue: defaultValue,
 	}, nil
 }
 

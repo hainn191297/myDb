@@ -39,10 +39,11 @@ type TableDef struct {
 
 // ColumnDef represents a column's schema definition.
 type ColumnDef struct {
-	Name       string   `json:"name"`
-	Type       DataType `json:"type"`
-	Nullable   bool     `json:"nullable"`
-	PrimaryKey bool     `json:"primary_key"`
+	Name         string   `json:"name"`
+	Type         DataType `json:"type"`
+	Nullable     bool     `json:"nullable"`
+	PrimaryKey   bool     `json:"primary_key"`
+	DefaultValue string   `json:"default_value,omitempty"`
 }
 
 // IndexDef represents an index definition.

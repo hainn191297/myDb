@@ -9,6 +9,7 @@ import (
 
 	"github.com/hainn191297/myDb/internal/logging"
 	"github.com/hainn191297/myDb/internal/schema"
+	"github.com/hainn191297/myDb/internal/sql/expr"
 	"github.com/hainn191297/myDb/internal/sql/planner"
 	"github.com/hainn191297/myDb/internal/storage/engine"
 	"github.com/hainn191297/myDb/internal/txn"
@@ -168,7 +169,7 @@ func (e *Executor) nextSeqScan(ctx context.Context, op *planner.SeqScanOp) (bool
 		var decodedValues [][]byte
 		if e.tableDef != nil {
 			var err error
-			decodedValues, err = decodeRow(val, len(e.tableDef.Columns))
+			decodedValues, err = DecodeRow(val, len(e.tableDef.Columns))
 			if err != nil {
 				return false, fmt.Errorf("executor: decode row: %w", err)
 			}
@@ -238,7 +239,7 @@ func (e *Executor) initSeqScan(ctx context.Context, op *planner.SeqScanOp) error
 		e.tableDef = tableDef
 	}
 
-	specs, err := buildColumnSpecs(e.tableDef, op.Columns)
+	specs, err := buildColumnSpecs(e.tableDef, op.Columns, op.FilterExpr)
 	if err != nil {
 		iter.Close()
 		return err
@@ -250,7 +251,7 @@ func (e *Executor) initSeqScan(ctx context.Context, op *planner.SeqScanOp) error
 }
 
 // buildColumnSpecs creates projection specs from requested columns.
-func buildColumnSpecs(tableDef *schema.TableDef, columns []string) ([]columnSpec, error) {
+func buildColumnSpecs(tableDef *schema.TableDef, columns []string, filter expr.Expr) ([]columnSpec, error) {
 	if tableDef == nil {
 		// Legacy/Raw mode: only allow "key" and "value"
 		specs := make([]columnSpec, 0, len(columns))
@@ -308,6 +309,32 @@ func buildColumnSpecs(tableDef *schema.TableDef, columns []string) ([]columnSpec
 			return nil, fmt.Errorf("executor: column %q not found in table %s", colName, tableDef.Table)
 		}
 	}
+
+	// Add columns from filter expression
+	if filter != nil {
+		expr.Walk(filter, func(e expr.Expr) {
+			if col, ok := e.(*expr.ColumnRefExpr); ok {
+				// Check if column is already in specs
+				found := false
+				for _, spec := range specs {
+					if spec.name == col.Name {
+						found = true
+						break
+					}
+				}
+				if !found {
+					// Find column in table
+					for i, tableCol := range tableDef.Columns {
+						if tableCol.Name == col.Name {
+							specs = append(specs, columnSpec{name: col.Name, kind: columnValue, index: i})
+							break
+						}
+					}
+				}
+			}
+		})
+	}
+
 	return specs, nil
 }
 
@@ -466,6 +493,12 @@ func (e *Executor) executeInsert(ctx context.Context, op *planner.InsertOp) erro
 	}
 	logging.DebugContext(ctx, "[Executor] Resolved storage engine for %s.%s", op.Schema, op.Table)
 
+	// Get table definition
+	tableDef, err := e.catalog.GetTable(op.Schema, op.Table)
+	if err != nil {
+		return fmt.Errorf("executor: get table definition for %s.%s: %w", op.Schema, op.Table, err)
+	}
+
 	// Get indexes once
 	indexes, err := e.catalog.GetIndexes(op.Schema, op.Table)
 	if err != nil {
@@ -474,9 +507,39 @@ func (e *Executor) executeInsert(ctx context.Context, op *planner.InsertOp) erro
 
 	// Iterate over all rows in the batch
 	for i, rowValues := range op.Values {
+		// Handle default values
+		finalValues := make([][]byte, len(tableDef.Columns))
+		for colIdx, colDef := range tableDef.Columns {
+			// Check if a value is provided for this column
+			provided := false
+			for opColIdx, opColName := range op.Columns {
+				if opColName == colDef.Name {
+					finalValues[colIdx] = rowValues[opColIdx]
+					provided = true
+					break
+				}
+			}
+
+			if !provided {
+				if colDef.DefaultValue != "" {
+					// Use default value
+					encodedVal, err := colDef.Type.Encode(colDef.DefaultValue)
+					if err != nil {
+						return fmt.Errorf("executor: encode default value for column %s: %w", colDef.Name, err)
+					}
+					finalValues[colIdx] = encodedVal
+				} else if colDef.Nullable {
+					// Use NULL
+					finalValues[colIdx] = nil
+				} else {
+					return fmt.Errorf("executor: missing value for non-nullable column %s", colDef.Name)
+				}
+			}
+		}
+
 		// Encode row: [len1][val1][len2][val2]...
 		var rowData []byte
-		for _, value := range rowValues {
+		for _, value := range finalValues {
 			// Write length prefix (4 bytes)
 			lenBytes := make([]byte, 4)
 			lenBytes[0] = byte(len(value))
@@ -488,7 +551,7 @@ func (e *Executor) executeInsert(ctx context.Context, op *planner.InsertOp) erro
 		}
 
 		// Use first column as key (simple strategy for MVP)
-		key := rowValues[0]
+		key := finalValues[0]
 
 		// Check for duplicate primary key
 		if _, err := eng.Get(ctx, key); err == nil {
@@ -515,7 +578,7 @@ func (e *Executor) executeInsert(ctx context.Context, op *planner.InsertOp) erro
 			}
 
 			// Extract index key from current row values
-			indexKey, err := extractIndexKeyFromOp(rowValues, op.Columns, idx.Columns)
+			indexKey, err := extractIndexKeyFromOp(finalValues, op.Columns, idx.Columns)
 			if err != nil {
 				return fmt.Errorf("executor: extract key for index %s: %w", idx.IndexName, err)
 			}
@@ -577,7 +640,7 @@ func (e *Executor) executeUpdate(ctx context.Context, op *planner.UpdateOp) erro
 		rowData := iter.Value()
 
 		// Decode row
-		oldValues, err := decodeRow(rowData, len(tableDef.Columns))
+		oldValues, err := DecodeRow(rowData, len(tableDef.Columns))
 		if err != nil {
 			return fmt.Errorf("executor: decode row: %w", err)
 		}
@@ -719,7 +782,7 @@ func (e *Executor) executeDelete(ctx context.Context, op *planner.DeleteOp) erro
 		// Evaluate filter using FilterExpr if available
 		if op.FilterExpr != nil {
 			// Decode row for filtering
-			values, err := decodeRow(rowData, len(tableDef.Columns))
+			values, err := DecodeRow(rowData, len(tableDef.Columns))
 			if err != nil {
 				return fmt.Errorf("executor: decode row for filter: %w", err)
 			}
@@ -767,7 +830,7 @@ func (e *Executor) executeDelete(ctx context.Context, op *planner.DeleteOp) erro
 		if err != nil {
 			return err
 		}
-		values, err := decodeRow(rowData, len(tableDef.Columns))
+		values, err := DecodeRow(rowData, len(tableDef.Columns))
 		if err != nil {
 			return err
 		}
@@ -849,7 +912,7 @@ func (e *Executor) matchesFilter(schemaName, table string, key, rowData []byte, 
 	}
 
 	// Decode row
-	values, err := decodeRow(rowData, len(tableDef.Columns))
+	values, err := DecodeRow(rowData, len(tableDef.Columns))
 	if err != nil {
 		return false
 	}
@@ -881,8 +944,8 @@ func (e *Executor) matchesFilter(schemaName, table string, key, rowData []byte, 
 	return string(values[idx]) == string(encodedVal)
 }
 
-// decodeRow decodes a row from storage format.
-func decodeRow(data []byte, numColumns int) ([][]byte, error) {
+// DecodeRow decodes a row from storage format.
+func DecodeRow(data []byte, numColumns int) ([][]byte, error) {
 	values := make([][]byte, 0, numColumns)
 	offset := 0
 
@@ -952,7 +1015,7 @@ func (e *Executor) executeCreateIndex(ctx context.Context, op *planner.CreateInd
 		rowData := iter.Value()
 
 		// Decode row to get column values
-		values, err := decodeRow(rowData, len(tableDef.Columns))
+		values, err := DecodeRow(rowData, len(tableDef.Columns))
 		if err != nil {
 			return fmt.Errorf("executor: decode row: %w", err)
 		}
@@ -1086,7 +1149,7 @@ func (e *Executor) nextIndexScan(ctx context.Context, op *planner.IndexScanOp) (
 		var decodedValues [][]byte
 		if e.tableDef != nil {
 			var err error
-			decodedValues, err = decodeRow(rowData, len(e.tableDef.Columns))
+			decodedValues, err = DecodeRow(rowData, len(e.tableDef.Columns))
 			if err != nil {
 				return false, fmt.Errorf("executor: decode row: %w", err)
 			}
@@ -1239,7 +1302,7 @@ func (e *Executor) initIndexScan(ctx context.Context, op *planner.IndexScanOp) e
 		return fmt.Errorf("executor: index scan: %w", err)
 	}
 
-	specs, err := buildColumnSpecs(tableDef, op.Columns)
+	specs, err := buildColumnSpecs(tableDef, op.Columns, nil)
 	if err != nil {
 		iter.Close()
 		return err

@@ -109,3 +109,18 @@ type UnaryExpr struct {
 }
 
 func (*UnaryExpr) exprNode() {}
+
+// Walk traverses an expression tree in depth-first order.
+func Walk(e Expr, visitor func(Expr)) {
+	if e == nil {
+		return
+	}
+	visitor(e)
+	switch n := e.(type) {
+	case *BinaryExpr:
+		Walk(n.Left, visitor)
+		Walk(n.Right, visitor)
+	case *UnaryExpr:
+		Walk(n.Expr, visitor)
+	}
+}
